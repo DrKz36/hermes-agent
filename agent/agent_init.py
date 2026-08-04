@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import StreamingContextScrubber
+from agent.no_tools import NoToolsBootstrapError, no_tools_bootstrap_active
 from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -59,6 +59,19 @@ from utils import base_url_host_matches, is_truthy_value
 # ``logger = logging.getLogger(__name__)``, which resolves to "run_agent"
 # from inside that module.)
 logger = logging.getLogger("run_agent")
+
+
+class _NoToolsStreamContextScrubber:
+    """Pass through streaming output when no memory context can exist."""
+
+    def reset(self) -> None:
+        return None
+
+    def feed(self, text: str) -> str:
+        return text or ""
+
+    def flush(self) -> str:
+        return ""
 
 
 def _ra():
@@ -518,6 +531,7 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    no_tools: bool = False,
     session_db=None,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
@@ -609,6 +623,14 @@ def init_agent(
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
+    agent.no_tools = bool(no_tools)
+    if agent.no_tools and not no_tools_bootstrap_active():
+        raise NoToolsBootstrapError(
+            "--no-tools requires the pre-import CLI bootstrap"
+        )
+    # Memory is a capability-bearing extension surface. Keep the ordinary
+    # governance/rules path intact while disabling every memory initializer.
+    skip_memory = bool(skip_memory or agent.no_tools)
     agent.pass_session_id = pass_session_id
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -663,6 +685,16 @@ def init_agent(
         agent.api_mode = nous_api_mode(agent.model)
     else:
         agent.api_mode = "chat_completions"
+
+    if agent.no_tools:
+        if agent.api_mode == "codex_app_server":
+            raise NoToolsBootstrapError(
+                "--no-tools cannot use the codex_app_server runtime"
+            )
+        if agent.provider == "moa":
+            raise NoToolsBootstrapError(
+                "--no-tools cannot use the multi-provider MoA runtime"
+            )
 
     # Credential-pool validation runs AFTER provider auto-detection so
     # a pool scoped to e.g. "anthropic" is not rejected when the agent
@@ -740,7 +772,7 @@ def init_agent(
     # AIAgent is created for every gateway request, so without the guard
     # each message leaks one OS thread and the process eventually exhausts
     # the system thread limit (RuntimeError: can't start new thread).
-    if (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
+    if (not agent.no_tools) and (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
             not _ra()._openrouter_prewarm_done.is_set():
         _ra()._openrouter_prewarm_done.set()
         threading.Thread(
@@ -828,8 +860,8 @@ def init_agent(
     agent.openrouter_min_coding_score = openrouter_min_coding_score
 
     # Store toolset filtering options
-    agent.enabled_toolsets = enabled_toolsets
-    agent.disabled_toolsets = disabled_toolsets
+    agent.enabled_toolsets = [] if agent.no_tools else enabled_toolsets
+    agent.disabled_toolsets = [] if agent.no_tools else disabled_toolsets
     
     # Model response configuration
     agent.max_tokens = max_tokens  # None = use model default
@@ -905,7 +937,7 @@ def init_agent(
     # Opt-out flag for the between-turns MCP tool refresh (build_turn_context).
     # Set on internal forks (e.g. background_review) that must keep ``tools[]``
     # byte-identical to a parent for provider cache parity.
-    agent._skip_mcp_refresh = False
+    agent._skip_mcp_refresh = bool(agent.no_tools)
     # Registry generation the current tool snapshot was derived from. Lets a
     # late/concurrent refresh reject a stale (older-generation) rebuild instead
     # of clobbering a newer one. Set adjacent to the tool snapshot below.
@@ -930,26 +962,30 @@ def init_agent(
     agent._or_cache_hits: int = 0
 
     # Centralized logging — agent.log (INFO+) and errors.log (WARNING+)
-    # both live under ~/.hermes/logs/.  Idempotent, so gateway mode
-    # (which creates a new AIAgent per message) won't duplicate handlers.
-    from hermes_logging import setup_logging, setup_verbose_logging
-    setup_logging(hermes_home=_ra()._hermes_home)
+    # both live under ~/.hermes/logs/.  The constrained machine-only
+    # ``--no-tools -Q -q`` path deliberately has no logging side effect:
+    # QueueListener starts monitor threads and writes to the Hermes home,
+    # neither of which belongs to its synchronous byte-exact contract.
+    if not agent.no_tools:
+        from hermes_logging import setup_logging, setup_verbose_logging
 
-    if agent.verbose_logging:
-        setup_verbose_logging()
-        _ra().logger.info("Verbose logging enabled (third-party library logs suppressed)")
-    elif agent.quiet_mode:
-        # In quiet mode (CLI default), keep console output clean —
-        # but DO NOT raise per-logger levels. Doing so prevents the
-        # root logger's file handlers (agent.log, errors.log) from
-        # ever seeing the records, because Python checks
-        # logger.isEnabledFor() before handler propagation. We rely
-        # on the fact that hermes_logging.setup_logging() does not
-        # install a console StreamHandler in quiet mode — so INFO
-        # records flow to the file handlers but never reach a
-        # console. Any future noise reduction belongs at the
-        # handler level inside hermes_logging.py, not here.
-        pass
+        setup_logging(hermes_home=_ra()._hermes_home)
+
+        if agent.verbose_logging:
+            setup_verbose_logging()
+            _ra().logger.info("Verbose logging enabled (third-party library logs suppressed)")
+        elif agent.quiet_mode:
+            # In quiet mode (CLI default), keep console output clean —
+            # but DO NOT raise per-logger levels. Doing so prevents the
+            # root logger's file handlers (agent.log, errors.log) from
+            # ever seeing the records, because Python checks
+            # logger.isEnabledFor() before handler propagation. We rely
+            # on the fact that hermes_logging.setup_logging() does not
+            # install a console StreamHandler in quiet mode — so INFO
+            # records flow to the file handlers but never reach a
+            # console. Any future noise reduction belongs at the
+            # handler level inside hermes_logging.py, not here.
+            pass
     
     # Internal stream callback (set during streaming TTS).
     # Initialized here so _vprint can reference it before run_conversation.
@@ -960,7 +996,12 @@ def init_agent(
     # Stateful scrubber for <memory-context> spans split across stream
     # deltas (#5719).  sanitize_context() alone can't survive chunk
     # boundaries because the block regex needs both tags in one string.
-    agent._stream_context_scrubber = StreamingContextScrubber()
+    if agent.no_tools:
+        agent._stream_context_scrubber = _NoToolsStreamContextScrubber()
+    else:
+        from agent.memory_manager import StreamingContextScrubber
+
+        agent._stream_context_scrubber = StreamingContextScrubber()
     # Stateful scrubber for reasoning/thinking tags in streamed deltas
     # (#17924).  Replaces the per-delta _strip_think_blocks regex that
     # destroyed downstream state (e.g. MiniMax-M2.7 streaming
@@ -1398,7 +1439,9 @@ def init_agent(
     # when the primary is exhausted (rate-limit, overload, connection
     # failure).  Supports both legacy single-dict ``fallback_model`` and
     # new list ``fallback_providers`` format.
-    if isinstance(fallback_model, list):
+    if agent.no_tools:
+        agent._fallback_chain = []
+    elif isinstance(fallback_model, list):
         agent._fallback_chain = [
             f for f in fallback_model
             if isinstance(f, dict) and f.get("provider") and f.get("model")
@@ -1422,16 +1465,20 @@ def init_agent(
     # Get available tools with filtering. Capture the registry generation this
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
     # whether it holds a newer or staler view (see refresh_agent_mcp_tools).
-    try:
-        from tools.registry import registry as _snapshot_registry
-        agent._tool_snapshot_generation = _snapshot_registry._generation
-    except Exception:
+    if agent.no_tools:
         agent._tool_snapshot_generation = 0
-    agent.tools = _ra().get_tool_definitions(
-        enabled_toolsets=enabled_toolsets,
-        disabled_toolsets=disabled_toolsets,
-        quiet_mode=agent.quiet_mode,
-    )
+        agent.tools = []
+    else:
+        try:
+            from tools.registry import registry as _snapshot_registry
+            agent._tool_snapshot_generation = _snapshot_registry._generation
+        except Exception:
+            agent._tool_snapshot_generation = 0
+        agent.tools = _ra().get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=agent.quiet_mode,
+        )
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
@@ -1454,10 +1501,14 @@ def init_agent(
     # Resolving the ~835-token block once here avoids re-running the
     # membership test + reference on every system-prompt rebuild
     # (init + each context compression).
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
-    )
+    if agent.no_tools:
+        agent._kanban_worker_guidance = ""
+    else:
+        from agent.prompt_builder import KANBAN_GUIDANCE
+
+        agent._kanban_worker_guidance = (
+            KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
+        )
 
     # Check tool requirements
     if agent.tools and not agent.quiet_mode:
@@ -1553,14 +1604,19 @@ def init_agent(
     # from the persisted string and is used only to place an early cache marker.
     agent._cached_system_prompt_static: Optional[str] = None
     
-    # Filesystem checkpoint manager (transparent — not a tool)
-    from tools.checkpoint_manager import CheckpointManager
-    agent._checkpoint_mgr = CheckpointManager(
-        enabled=checkpoints_enabled,
-        max_snapshots=checkpoint_max_snapshots,
-        max_total_size_mb=checkpoint_max_total_size_mb,
-        max_file_size_mb=checkpoint_max_file_size_mb,
-    )
+    # Checkpoints retain filesystem state and must not even initialize in the
+    # constrained path.
+    if agent.no_tools:
+        agent._checkpoint_mgr = None
+    else:
+        from tools.checkpoint_manager import CheckpointManager
+
+        agent._checkpoint_mgr = CheckpointManager(
+            enabled=checkpoints_enabled,
+            max_snapshots=checkpoint_max_snapshots,
+            max_total_size_mb=checkpoint_max_total_size_mb,
+            max_file_size_mb=checkpoint_max_file_size_mb,
+        )
     
     # SQLite session store (optional -- provided by CLI or gateway)
     agent._session_db = session_db
@@ -1603,9 +1659,13 @@ def init_agent(
     except Exception:
         pass
     
-    # In-memory todo list for task planning (one per agent/session)
-    from tools.todo_tool import TodoStore
-    agent._todo_store = TodoStore()
+    # In-memory todo state is a tool-capable planner surface.
+    if agent.no_tools:
+        agent._todo_store = None
+    else:
+        from tools.todo_tool import TodoStore
+
+        agent._todo_store = TodoStore()
     
     # Load config once for memory, skills, and compression sections
     try:
@@ -1674,7 +1734,7 @@ def init_agent(
     # So the built-in store is created unless memory is globally disabled, while
     # the external-provider block below stays gated on skip_memory.
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
-    if not skip_memory or _memory_toolset_requested:
+    if not agent.no_tools and (not skip_memory or _memory_toolset_requested):
         try:
             mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
@@ -1695,7 +1755,7 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
-    if not skip_memory:
+    if not agent.no_tools and not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
@@ -1760,8 +1820,10 @@ def init_agent(
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
             agent._memory_manager = None
 
-    from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
-    _inject_memory_provider_tools(agent)
+    if not agent.no_tools:
+        from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
+
+        _inject_memory_provider_tools(agent)
 
     # Skills config: nudge interval for skill creation reminders
     agent._skill_nudge_interval = 10
@@ -1800,7 +1862,9 @@ def init_agent(
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics
     # are noisy.
-    agent._environment_probe = bool(_agent_section.get("environment_probe", True))
+    agent._environment_probe = (
+        False if agent.no_tools else bool(_agent_section.get("environment_probe", True))
+    )
     # Warm the probe off-thread: it shells out to python3/pip (~0.5s of
     # subprocess round-trips) and its result lands in the FIRST system
     # prompt build, which sits on the time-to-first-token critical path.
@@ -1838,7 +1902,7 @@ def init_agent(
         _api_retries = max(_api_retries, 1)  # 1 = no retry (single attempt)
     except (TypeError, ValueError):
         _api_retries = 3
-    agent._api_max_retries = _api_retries
+    agent._api_max_retries = 1 if agent.no_tools else _api_retries
 
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit
@@ -1891,7 +1955,11 @@ def init_agent(
         )
     except Exception:
         pass
-    compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
+    compression_enabled = (
+        False
+        if agent.no_tools
+        else str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
+    )
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
     # Minimum REAL (actionable) user messages guaranteed to survive in the
@@ -2384,11 +2452,12 @@ def init_agent(
     _selected_engine = None
     _copy_failed = False
     _engine_name = "compressor"  # default
-    try:
-        _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
-        _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
-    except Exception:
-        pass
+    if not agent.no_tools:
+        try:
+            _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
+            _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
+        except Exception:
+            pass
 
     if _engine_name != "compressor":
         # Try loading from plugins/context_engine/<name>/
@@ -2583,6 +2652,8 @@ def init_agent(
     # same local-model latency penalty.
     agent._context_engine_tool_names: set = set()
     if (
+        not agent.no_tools
+        and
         hasattr(agent, "context_compressor")
         and agent.context_compressor
         and agent.tools is not None
@@ -2619,7 +2690,11 @@ def init_agent(
             _existing_tool_names.add(_tname)
 
     # Notify context engine of session start
-    if hasattr(agent, "context_compressor") and agent.context_compressor:
+    if (
+        not agent.no_tools
+        and hasattr(agent, "context_compressor")
+        and agent.context_compressor
+    ):
         try:
             agent.context_compressor.on_session_start(
                 agent.session_id,
@@ -2798,6 +2873,11 @@ def init_agent(
             "anthropic_base_url": agent._anthropic_base_url,
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
+
+    if agent.no_tools:
+        from agent.no_tools import assert_no_tools_agent_invariant
+
+        assert_no_tools_agent_invariant(agent, phase="agent initialization")
 
 
 

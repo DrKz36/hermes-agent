@@ -109,6 +109,11 @@ def memory_provider_tools_enabled(
 
 def inject_memory_provider_tools(agent: Any) -> int:
     """Append external memory-provider tool schemas to an agent tool surface."""
+    if getattr(agent, "no_tools", False):
+        from agent.no_tools import assert_no_tools_agent_invariant
+
+        assert_no_tools_agent_invariant(agent, phase="memory tool injection")
+        return 0
     memory_manager = getattr(agent, "_memory_manager", None)
     tools = getattr(agent, "tools", None)
     if not memory_manager or tools is None:

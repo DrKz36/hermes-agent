@@ -517,6 +517,24 @@ _ensure_project_root_on_path_fast()
 def _apply_profile_override() -> None:
     """Pre-parse --profile/-p and set HERMES_HOME before imports."""
     argv = sys.argv[1:]
+    # ``--profile`` is consumed before argparse can validate chat flags.  The
+    # constrained no-tools mode must reject it before it redirects HERMES_HOME
+    # to another profile.
+    try:
+        from agent.no_tools import (
+            NoToolsError,
+            bootstrap_no_tools_from_argv,
+            reject_no_tools_profile_override,
+        )
+
+        reject_no_tools_profile_override(argv)
+        # This function runs during module import, before optional main-module
+        # imports can discover provider/plugin surfaces.  ``main()`` repeats
+        # the idempotent call as a defensive command-entry boundary.
+        bootstrap_no_tools_from_argv(argv)
+    except NoToolsError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
     profile_name = None
     consume = 0
     profile_index = None
@@ -691,10 +709,12 @@ _apply_profile_override()
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
+from agent.no_tools import no_tools_bootstrap_active
 from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
-load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
+if not no_tools_bootstrap_active():
+    load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
@@ -743,20 +763,22 @@ except Exception:
 # Initialize centralized file logging early — all `hermes` subcommands
 # (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
 # Dashboard entrypoints bootstrap with GUI mode so gui.log is always present
-# during GUI testing, including pre-dispatch startup failures.
-try:
-    from hermes_logging import setup_logging as _setup_logging
+# during GUI testing, including pre-dispatch startup failures. The constrained
+# machine transport keeps no log state or pre-dispatch diagnostics.
+if not no_tools_bootstrap_active():
+    try:
+        from hermes_logging import setup_logging as _setup_logging
 
-    _setup_logging(
-        mode=(
-            "gui"
-            if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
-            in {"dashboard", "serve", "gui", "desktop"}
-            else "cli"
+        _setup_logging(
+            mode=(
+                "gui"
+                if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
+                in {"dashboard", "serve", "gui", "desktop"}
+                else "cli"
+            )
         )
-    )
-except Exception:
-    pass  # best-effort — don't crash the CLI if logging setup fails
+    except Exception:
+        pass  # best-effort — don't crash the CLI if logging setup fails
 
 # Apply IPv4 preference early, before any HTTP clients are created.
 # We already determined whether to force IPv4 from the raw yaml read above —
@@ -2527,6 +2549,15 @@ def _resolve_use_tui(args) -> bool:
 
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    if getattr(args, "no_tools", False):
+        _prepare_no_tools_cli_bootstrap_or_exit(args)
+        # This route deliberately bypasses classic/TUI startup, resume,
+        # update checks, bundled-skill sync, and kanban setup.  It is the
+        # only public ``--no-tools`` execution path.
+        from cli import main as cli_main
+
+        return cli_main(query=args.query, quiet=True, no_tools=True)
+
     use_tui = _resolve_use_tui(args)
 
     _apply_safe_mode(args)
@@ -10663,6 +10694,13 @@ def _plugin_cli_discovery_needed() -> bool:
     argparse setup, saving ~500-650ms per invocation for users whose
     enabled plugins don't contribute any CLI command.
     """
+    from agent.no_tools import argv_requests_no_tools
+
+    if argv_requests_no_tools():
+        # Do not dynamically register a plugin CLI command before the strict
+        # post-parse policy gate gets a chance to reject this invocation.
+        return False
+
     first = _first_positional_argv()
     if first is None:
         # Bare ``hermes`` or only flags → defaults to ``chat``.
@@ -10736,6 +10774,13 @@ def _should_background_mcp_startup(args) -> bool:
 
 def _prepare_agent_startup(args) -> None:
     """Discover plugins/MCP/hooks for commands that can run an agent turn."""
+    _prepare_no_tools_cli_bootstrap_or_exit(args)
+    if getattr(args, "no_tools", False):
+        # Rules are loaded by the normal prompt builder later.  This boundary
+        # excludes only extension-capable startup and must happen before every
+        # plugin, MCP, or hook import below.
+        return
+
     # --yolo: chokepoint guarantee that HERMES_YOLO_MODE is set before ANY
     # plugin/tool discovery below imports tools.approval, which freezes
     # _YOLO_MODE_FROZEN at import time (PR #7994 security design).  main()'s
@@ -10825,6 +10870,21 @@ def _apply_safe_mode(args) -> None:
     os.environ["HERMES_SAFE_MODE"] = "1"
     os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
     os.environ["HERMES_IGNORE_RULES"] = "1"
+
+
+def _prepare_no_tools_cli_bootstrap_or_exit(args, parser=None) -> None:
+    """Validate and arm the no-tools policy before agent startup."""
+    if not getattr(args, "no_tools", False):
+        return
+    try:
+        from agent.no_tools import NoToolsError, prepare_no_tools_cli_bootstrap
+
+        prepare_no_tools_cli_bootstrap(args)
+    except NoToolsError as exc:
+        if parser is not None:
+            parser.error(str(exc))
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
 
 
 def _set_chat_arg_defaults(args) -> None:
@@ -11154,6 +11214,32 @@ def cmd_claw(args):
 
 def main():
     """Main entry point for hermes CLI."""
+    # The full parser imports many optional command modules.  Arm the tiny
+    # internal policy first.  A valid constrained invocation then bypasses
+    # that parser entirely, so its optional subcommands cannot import or
+    # discover extension surfaces before the machine-only dispatch.
+    try:
+        from agent.no_tools import (
+            NoToolsError,
+            argv_requests_no_tools,
+            bootstrap_no_tools_from_argv,
+            no_tools_raw_query,
+        )
+
+        bootstrap_no_tools_from_argv()
+        if argv_requests_no_tools():
+            query = no_tools_raw_query()
+            from cli import main as cli_main
+
+            return cli_main(
+                query=query,
+                quiet=True,
+                no_tools=True,
+            )
+    except NoToolsError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
     _set_process_title()
@@ -12493,6 +12579,11 @@ def main():
     if args.version:
         cmd_version(args)
         return
+
+    # The post-parse gate precedes yolo and the shared startup routine.  A
+    # rejected interactive invocation therefore cannot start prewarm threads,
+    # process_loop, plugin discovery, MCP discovery, or shell hooks.
+    _prepare_no_tools_cli_bootstrap_or_exit(args, parser=parser)
 
     # --yolo: set HERMES_YOLO_MODE *before* plugin discovery.  The call to
     # _prepare_agent_startup() below triggers discover_plugins() → tool

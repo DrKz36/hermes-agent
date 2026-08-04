@@ -90,6 +90,12 @@ class CLIAgentSetupMixin:
         resolved_acp_command = runtime.get("command")
         resolved_acp_args = list(runtime.get("args") or [])
         resolved_credential_pool = runtime.get("credential_pool")
+        if getattr(self, "no_tools", False) and resolved_api_mode != "chat_completions":
+            from agent.no_tools import NoToolsConflictError
+
+            raise NoToolsConflictError(
+                "--no-tools supports only the synchronous chat-completions transport"
+            )
         # A callable api_key is a bearer-token provider (Azure Foundry
         # Entra ID — ``azure_identity_adapter.build_token_provider``).
         # The OpenAI SDK accepts ``Callable[[], str]`` for ``api_key`` and
@@ -139,6 +145,11 @@ class CLIAgentSetupMixin:
         self._provider_source = runtime.get("source")
         self.api_key = api_key
         self.base_url = base_url
+        if getattr(self, "no_tools", False):
+            # The constrained one-shot path resolves its selected runtime once
+            # before routing, then reuses that exact in-process result for the
+            # synchronous agent construction below.
+            self._no_tools_runtime_resolved = True
 
         # When a custom_provider entry carries an explicit `model` field,
         # use it as the effective model name.  Without this, running
@@ -339,25 +350,34 @@ class CLIAgentSetupMixin:
             bool: True if successful, False otherwise
         """
         from cli import AIAgent, ChatConsole, _DIM, _RST, _accent_hex, _cprint, _prepare_deferred_agent_startup, logger
+        no_tools = bool(getattr(self, "no_tools", False))
         if self.agent is not None:
             return True
 
-        _prepare_deferred_agent_startup()
-        self._install_tool_callbacks()
-        self._ensure_tirith_security()
+        if not no_tools:
+            _prepare_deferred_agent_startup()
+            self._install_tool_callbacks()
+            self._ensure_tirith_security()
 
-        if not self._ensure_runtime_credentials():
-            return False
+        if not (
+            no_tools
+            and bool(getattr(self, "_no_tools_runtime_resolved", False))
+        ):
+            if not self._ensure_runtime_credentials():
+                return False
 
-        from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
+        if not no_tools:
+            from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
 
-        ensure_mcp_discovery_before_agent_build(
-            logger=logger,
-            single_query=getattr(self, "_single_query_mode", False),
-        )
+            ensure_mcp_discovery_before_agent_build(
+                logger=logger,
+                single_query=getattr(self, "_single_query_mode", False),
+            )
 
-        # Initialize SQLite session store for CLI sessions (if not already done in __init__)
-        if self._session_db is None:
+        # The constrained one-shot path has no persistence or resume contract.
+        # In particular, do not create SessionDB here: its token writer is a
+        # background thread and would create durable state after dispatch.
+        if not no_tools and self._session_db is None:
             try:
                 from hermes_state import SessionDB
                 self._session_db = SessionDB()
@@ -499,23 +519,32 @@ class CLIAgentSetupMixin:
                 clarify_callback=self._clarify_callback,
                 reasoning_callback=self._current_reasoning_callback(),
 
-                fallback_model=self._fallback_model,
-                thinking_callback=self._on_thinking,
-                checkpoints_enabled=self.checkpoints_enabled,
+                fallback_model=[] if no_tools else self._fallback_model,
+                thinking_callback=None if no_tools else self._on_thinking,
+                checkpoints_enabled=False if no_tools else self.checkpoints_enabled,
                 checkpoint_max_snapshots=self.checkpoint_max_snapshots,
                 checkpoint_max_total_size_mb=self.checkpoint_max_total_size_mb,
                 checkpoint_max_file_size_mb=self.checkpoint_max_file_size_mb,
-                pass_session_id=self.pass_session_id,
+                pass_session_id=False if no_tools else self.pass_session_id,
                 skip_context_files=self.ignore_rules,
-                skip_memory=self.ignore_rules,
-                tool_progress_callback=self._on_tool_progress,
-                tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
-                tool_complete_callback=self._on_tool_complete if self._inline_diffs_enabled else None,
-                stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
-                tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
-                notice_callback=self._on_notice,
-                notice_clear_callback=self._on_notice_clear,
-                reaction_callback=self._on_reaction,
+                skip_memory=self.ignore_rules or no_tools,
+                no_tools=no_tools,
+                tool_progress_callback=None if no_tools else self._on_tool_progress,
+                tool_start_callback=(
+                    None if no_tools else self._on_tool_start if self._inline_diffs_enabled else None
+                ),
+                tool_complete_callback=(
+                    None if no_tools else self._on_tool_complete if self._inline_diffs_enabled else None
+                ),
+                stream_delta_callback=(
+                    None if no_tools else self._stream_delta if self.streaming_enabled else None
+                ),
+                tool_gen_callback=(
+                    None if no_tools else self._on_tool_gen_start if self.streaming_enabled else None
+                ),
+                notice_callback=None if no_tools else self._on_notice,
+                notice_clear_callback=None if no_tools else self._on_notice_clear,
+                reaction_callback=None if no_tools else self._on_reaction,
             )
             # Store reference for atexit memory provider shutdown.
             # NOTE: this MUST write to the ``cli`` module's global, not a
@@ -535,12 +564,13 @@ class CLIAgentSetupMixin:
             # depletion / usage-band warning shows before the first message. The
             # notice_callback is bound above → _on_notice renders the line. Idempotent
             # + fail-open inside the helper; harmless for non-Nous providers.
-            try:
-                from agent.credits_tracker import seed_credits_at_session_start
+            if not no_tools:
+                try:
+                    from agent.credits_tracker import seed_credits_at_session_start
 
-                seed_credits_at_session_start(self.agent)
-            except Exception:
-                pass
+                    seed_credits_at_session_start(self.agent)
+                except Exception:
+                    pass
             self._active_agent_route_signature = (
                 effective_model,
                 runtime.get("provider"),

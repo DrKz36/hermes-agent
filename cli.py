@@ -224,11 +224,13 @@ from hermes_cli.browser_connect import (
     try_launch_chrome_debug,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
+from agent.no_tools import no_tools_bootstrap_active
 from utils import base_url_host_matches, fast_safe_load
 
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
-load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
+if not no_tools_bootstrap_active():
+    load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
 
 
 _REASONING_TAGS = (
@@ -633,6 +635,13 @@ def load_cli_config() -> Dict[str, Any]:
 
     defaults = managed_scope.apply_managed_overlay(defaults)
 
+    # The constrained machine transport may read the selected model/provider
+    # configuration, but it must not export terminal, browser, or auxiliary
+    # provider settings into this process. Those bridges exist solely for
+    # capability-bearing subsystems that this mode never initializes.
+    if no_tools_bootstrap_active():
+        return defaults
+
     # Apply terminal config to environment variables (so terminal_tool picks them up)
     terminal_config = defaults.get("terminal", {})
     
@@ -792,43 +801,47 @@ def load_cli_config() -> Dict[str, Any]:
 CLI_CONFIG = load_cli_config()
 
 
-# Initialize centralized logging early — agent.log + errors.log in ~/.hermes/logs/.
-# This ensures CLI sessions produce a log trail even before AIAgent is instantiated.
-try:
-    from hermes_logging import setup_logging
-    setup_logging(mode="cli")
-except Exception:
-    pass  # Logging setup is best-effort — don't crash the CLI
+# Initialize CLI-only diagnostics and display policy. A constrained ``-Q``
+# dispatch must keep stdout/stderr under its explicit contract and must not
+# create CLI log state before the request has run.
+if not no_tools_bootstrap_active():
+    # Initialize centralized logging early — agent.log + errors.log in ~/.hermes/logs/.
+    # This ensures CLI sessions produce a log trail even before AIAgent is instantiated.
+    try:
+        from hermes_logging import setup_logging
+        setup_logging(mode="cli")
+    except Exception:
+        pass  # Logging setup is best-effort — don't crash the CLI
 
-# Validate config structure early — print warnings before user hits cryptic errors
-try:
-    from hermes_cli.config import print_config_warnings
-    print_config_warnings()
-except Exception:
-    pass
+    # Validate config structure early — print warnings before user hits cryptic errors
+    try:
+        from hermes_cli.config import print_config_warnings
+        print_config_warnings()
+    except Exception:
+        pass
 
-# Initialize the skin engine from config
-try:
-    from hermes_cli.skin_engine import init_skin_from_config
-    init_skin_from_config(CLI_CONFIG)
-except Exception:
-    pass  # Skin engine is optional — default skin used if unavailable
+    # Initialize the skin engine from config
+    try:
+        from hermes_cli.skin_engine import init_skin_from_config
+        init_skin_from_config(CLI_CONFIG)
+    except Exception:
+        pass  # Skin engine is optional — default skin used if unavailable
 
-# Initialize tool preview length from config
-try:
-    from agent.display import set_tool_preview_max_len
-    _tpl = CLI_CONFIG.get("display", {}).get("tool_preview_length", 0)
-    set_tool_preview_max_len(int(_tpl) if _tpl else 0)
-except Exception:
-    pass
+    # Initialize tool preview length from config
+    try:
+        from agent.display import set_tool_preview_max_len
+        _tpl = CLI_CONFIG.get("display", {}).get("tool_preview_length", 0)
+        set_tool_preview_max_len(int(_tpl) if _tpl else 0)
+    except Exception:
+        pass
 
-# Initialize friendly tool labels from config (default on)
-try:
-    from agent.display import set_friendly_tool_labels
-    _ftl = CLI_CONFIG.get("display", {}).get("friendly_tool_labels", True)
-    set_friendly_tool_labels(bool(_ftl))
-except Exception:
-    pass
+    # Initialize friendly tool labels from config (default on)
+    try:
+        from agent.display import set_friendly_tool_labels
+        _ftl = CLI_CONFIG.get("display", {}).get("friendly_tool_labels", True)
+        set_friendly_tool_labels(bool(_ftl))
+    except Exception:
+        pass
 
 # Neuter AsyncHttpxClientWrapper.__del__ before any AsyncOpenAI clients are
 # created.  The SDK's __del__ schedules aclose() on asyncio.get_running_loop()
@@ -905,6 +918,8 @@ def AIAgent(*args, **kwargs):
 
 
 def get_tool_definitions(*args, **kwargs):
+    if no_tools_bootstrap_active():
+        return []
     from hermes_cli.mcp_startup import wait_for_mcp_discovery
     from model_tools import get_tool_definitions as _get_tool_definitions
 
@@ -913,6 +928,8 @@ def get_tool_definitions(*args, **kwargs):
 
 
 def get_toolset_for_tool(*args, **kwargs):
+    if no_tools_bootstrap_active():
+        return None
     from model_tools import get_toolset_for_tool as _get_toolset_for_tool
 
     return _get_toolset_for_tool(*args, **kwargs)
@@ -1348,6 +1365,12 @@ def _notify_single_query_session_finalize(cli, *, reason: str = "shutdown") -> N
 
 def _finalize_single_query(cli) -> None:
     """Close one-shot CLI resources before releasing the active session lease."""
+    if getattr(cli, "no_tools", False):
+        # This path has deliberately never created terminal, browser, MCP,
+        # hook, or memory resources.  Do not route it through the process-wide
+        # cleanup helper, which imports those capability modules at shutdown.
+        cli._release_active_session()
+        return
     try:
         _notify_single_query_session_finalize(cli)
         _run_cleanup(notify_session_finalize=False)
@@ -4225,6 +4248,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        no_tools: bool = False,
     ):
         """
         Initialize the Hermes CLI.
@@ -4242,6 +4266,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             resume: Session ID to resume (restores conversation history from SQLite)
             pass_session_id: Include the session ID in the agent's system prompt
         """
+        self.no_tools = bool(no_tools)
+        if self.no_tools:
+            from agent.no_tools import NoToolsBootstrapError, no_tools_bootstrap_active
+
+            if not no_tools_bootstrap_active():
+                raise NoToolsBootstrapError(
+                    "--no-tools requires the pre-import CLI bootstrap"
+                )
+
         # Initialize Rich console
         self.console = Console()
         self.config = CLI_CONFIG
@@ -4453,17 +4486,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self.max_turns = 500
         else:
             self.max_turns = 500
+
+        # This is a one-shot, machine-only transport, not a tool loop.  Do
+        # not let a selected profile or environment re-expand it into a
+        # multi-dispatch retry path.
+        if self.no_tools:
+            self.max_turns = 1
         
         # Parse and validate toolsets
-        self.enabled_toolsets = toolsets
-        self.disabled_toolsets = CLI_CONFIG["agent"].get("disabled_toolsets") or []
+        self.enabled_toolsets = [] if self.no_tools else toolsets
+        self.disabled_toolsets = (
+            [] if self.no_tools else CLI_CONFIG["agent"].get("disabled_toolsets") or []
+        )
 
-        if toolsets and "all" not in toolsets and "*" not in toolsets:
+        if self.enabled_toolsets and "all" not in self.enabled_toolsets and "*" not in self.enabled_toolsets:
             # Validate each toolset — MCP server names are resolved via
             # live registry aliases (registered during discover_mcp_tools),
             # but discovery hasn't run yet at this point, so exclude them.
             mcp_names = set((CLI_CONFIG.get("mcp_servers") or {}).keys())
-            invalid = [t for t in toolsets if not validate_toolset(t) and t not in mcp_names]
+            invalid = [t for t in self.enabled_toolsets if not validate_toolset(t) and t not in mcp_names]
             if invalid:
                 self._console_print(f"[bold red]Warning: Unknown toolsets: {', '.join(invalid)}[/]")
         
@@ -4471,16 +4512,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         cp_cfg = CLI_CONFIG.get("checkpoints", {})
         if isinstance(cp_cfg, bool):
             cp_cfg = {"enabled": cp_cfg}
-        self.checkpoints_enabled = checkpoints or cp_cfg.get("enabled", False)
+        self.checkpoints_enabled = (
+            False if self.no_tools else checkpoints or cp_cfg.get("enabled", False)
+        )
         self.checkpoint_max_snapshots = cp_cfg.get("max_snapshots", 20)
         self.checkpoint_max_total_size_mb = cp_cfg.get("max_total_size_mb", 500)
         self.checkpoint_max_file_size_mb = cp_cfg.get("max_file_size_mb", 10)
-        self.pass_session_id = pass_session_id
+        self.pass_session_id = False if self.no_tools else pass_session_id
         # --ignore-rules: honor either the constructor flag or the env var set
         # by `hermes chat --ignore-rules` in hermes_cli/main.py. When true we
         # pass skip_context_files=True and skip_memory=True to AIAgent so
         # AGENTS.md/SOUL.md/.cursorrules and persistent memory are not loaded.
         self.ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
+        if self.no_tools and self.ignore_rules:
+            from agent.no_tools import NoToolsConflictError
+
+            raise NoToolsConflictError(
+                "--no-tools requires governance rules; HERMES_IGNORE_RULES is not allowed"
+            )
         
         # Ephemeral system prompt: env var takes precedence, then config
         self.system_prompt = (
@@ -4490,8 +4539,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.personalities = CLI_CONFIG["agent"].get("personalities", {})
         
         # Ephemeral prefill messages (few-shot priming, never persisted)
-        self.prefill_messages = _load_prefill_messages(
-            _resolve_prefill_messages_file(CLI_CONFIG)
+        self.prefill_messages = (
+            []
+            if self.no_tools
+            else _load_prefill_messages(_resolve_prefill_messages_file(CLI_CONFIG))
         )
         
         # Reasoning config (OpenRouter reasoning effort level)
@@ -4543,7 +4594,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Fallback provider chain — tried in order when primary fails after retries.
         # Merge new ``fallback_providers`` entries with any legacy
         # ``fallback_model`` entries so old configs still participate.
-        self._fallback_model = get_fallback_chain(CLI_CONFIG)
+        self._fallback_model = [] if self.no_tools else get_fallback_chain(CLI_CONFIG)
 
         # Signature of the currently-initialised agent's runtime.  Used to
         # rebuild the agent when provider / model / base_url changes across
@@ -4552,6 +4603,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Agent will be initialized on first use
         self.agent: Optional[Any] = None
+        self._no_tools_runtime_resolved = False
         self._tool_callbacks_installed = False
         self._tirith_security_checked = False
         self._app = None  # prompt_toolkit Application (set in run())
@@ -4565,49 +4617,55 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._prompt_start_time: Optional[float] = None  # time.time() when turn started
         self._prompt_duration: float = 0.0  # frozen duration of last completed turn
         self._last_turn_finished_at: Optional[float] = None  # time.time() when the last agent loop finished
-        # Initialize SQLite session store early so /title works before first message
+        # Initialize SQLite session store early so /title works before first message.
+        # The constrained machine path has no resume, memory, or persistence
+        # contract: keeping a SessionDB would still start its token-writer
+        # thread and create durable session state after the provider reply.
         self._session_db = None
         self._session_db_unavailable = False
-        try:
-            from hermes_state import SessionDB
-            self._session_db = SessionDB()
-        except Exception as e:
-            # #41386: a failed session store means the transcript is NOT
-            # persisted to state.db — the live chat looks healthy but resume
-            # later shows a truncated/empty session. A buried log line is not
-            # enough; surface it prominently so the user knows persistence is
-            # off for this run and can fix the store before relying on resume.
-            self._session_db_unavailable = True
-            logger.warning("Failed to initialize SessionDB — session will NOT be indexed for search: %s", e)
+        if not self.no_tools:
             try:
-                # Console is imported at module scope; do NOT re-import it here.
-                # A function-local `import` would make `Console` a local name for
-                # the whole __init__ body and break the earlier `self.console =
-                # Console()` with UnboundLocalError.
-                Console(stderr=True).print(
-                    "[bold yellow]⚠ Session store unavailable[/bold yellow] — "
-                    "this conversation will [bold]NOT be saved[/bold] to disk and "
-                    "cannot be resumed later. Searching past sessions is also disabled.\n"
-                    f"  Reason: {e}\n"
-                    "  Fix the state.db store (e.g. `hermes update` to rebuild the venv) to restore persistence."
-                )
-            except Exception:
-                # Never let the warning path itself break startup.
-                print(
-                    "WARNING: Session store unavailable — this conversation will NOT be "
-                    f"saved to disk and cannot be resumed later. Reason: {e}"
-                )
+                from hermes_state import SessionDB
+                self._session_db = SessionDB()
+            except Exception as e:
+                # #41386: a failed session store means the transcript is NOT
+                # persisted to state.db — the live chat looks healthy but resume
+                # later shows a truncated/empty session. A buried log line is not
+                # enough; surface it prominently so the user knows persistence is
+                # off for this run and can fix the store before relying on resume.
+                self._session_db_unavailable = True
+                logger.warning("Failed to initialize SessionDB — session will NOT be indexed for search: %s", e)
+                try:
+                    # Console is imported at module scope; do NOT re-import it here.
+                    # A function-local `import` would make `Console` a local name for
+                    # the whole __init__ body and break the earlier `self.console =
+                    # Console()` with UnboundLocalError.
+                    Console(stderr=True).print(
+                        "[bold yellow]⚠ Session store unavailable[/bold yellow] — "
+                        "this conversation will [bold]NOT be saved[/bold] to disk and "
+                        "cannot be resumed later. Searching past sessions is also disabled.\n"
+                        f"  Reason: {e}\n"
+                        "  Fix the state.db store (e.g. `hermes update` to rebuild the venv) to restore persistence."
+                    )
+                except Exception:
+                    # Never let the warning path itself break startup.
+                    print(
+                        "WARNING: Session store unavailable — this conversation will NOT be "
+                        f"saved to disk and cannot be resumed later. Reason: {e}"
+                    )
 
         # Opportunistic state.db maintenance — runs at most once per
         # min_interval_hours, tracked via state_meta in state.db itself so
         # it's shared across all Hermes processes for this HERMES_HOME.
         # Never blocks startup on failure.
-        _run_state_db_auto_maintenance(self._session_db)
+        if not self.no_tools:
+            _run_state_db_auto_maintenance(self._session_db)
 
         # Opportunistic shadow-repo cleanup — deletes orphan/stale
         # checkpoint repos under ~/.hermes/checkpoints/.  Opt-in via
         # checkpoints.auto_prune, idempotent via .last_prune marker.
-        _run_checkpoint_auto_maintenance()
+        if not self.no_tools:
+            _run_checkpoint_auto_maintenance()
 
         # Deferred title: stored in memory until the session is created in the DB
         self._pending_title: Optional[str] = None
@@ -17974,6 +18032,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    no_tools: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -18020,9 +18079,62 @@ def main(
     except Exception:
         pass
 
-    # Signal to terminal_tool that we're in interactive mode
-    # This enables interactive sudo password prompts with timeout
-    os.environ["HERMES_INTERACTIVE"] = "1"
+    if no_tools:
+        from agent.no_tools import (
+            NoToolsBootstrapError,
+            NoToolsConflictError,
+            no_tools_bootstrap_active,
+            validate_no_tools_environment,
+        )
+
+        if not no_tools_bootstrap_active():
+            raise NoToolsBootstrapError(
+                "--no-tools requires the CLI bootstrap before importing cli"
+            )
+        validate_no_tools_environment()
+        query_candidate = query or q
+        invalid = []
+        if not quiet or not isinstance(query_candidate, str) or not query_candidate:
+            invalid.append("requires quiet text query")
+        if any(
+            (
+                image,
+                toolsets,
+                skills,
+                model,
+                provider,
+                reasoning,
+                api_key,
+                base_url,
+                max_turns is not None,
+                verbose,
+                compact,
+                list_tools,
+                list_toolsets,
+                gateway,
+                resume,
+                worktree,
+                w,
+                checkpoints,
+                pass_session_id,
+                ignore_user_config,
+                ignore_rules,
+                os.environ.get("HERMES_IGNORE_RULES", "").strip().lower()
+                in {"1", "true", "yes", "on"},
+                os.environ.get("HERMES_KANBAN_TASK"),
+                os.environ.get("HERMES_KANBAN_GOAL_MODE"),
+            )
+        ):
+            invalid.append("outside machine-only envelope")
+        if invalid:
+            raise NoToolsConflictError(
+                "--no-tools supports only `hermes chat --no-tools -Q -q <prompt>`; "
+                + ", ".join(invalid)
+            )
+    else:
+        # Signal to terminal_tool that we're in interactive mode. This is
+        # intentionally absent from the constrained one-shot path.
+        os.environ["HERMES_INTERACTIVE"] = "1"
     
     # Handle gateway mode (messaging + cron)
     if gateway:
@@ -18032,8 +18144,9 @@ def main(
         asyncio.run(start_gateway())
         return
 
-    # Skip worktree for list commands (they exit immediately)
-    if not list_tools and not list_toolsets:
+    # Skip worktree for list commands (they exit immediately). The no-tools
+    # path never evaluates config-driven worktree selection.
+    if not no_tools and not list_tools and not list_toolsets:
         # ── Git worktree isolation (#652) ──
         # Create an isolated worktree so this agent instance doesn't collide
         # with other agents working on the same repo.
@@ -18063,10 +18176,12 @@ def main(
     # Handle query shorthand
     query = query or q
     
-    # Parse toolsets - handle both string and tuple/list inputs
-    # Default to hermes-cli toolset which includes cronjob management tools
-    toolsets_list = None
-    if toolsets:
+    # Parse toolsets - handle both string and tuple/list inputs. The constrained
+    # path owns an explicit empty snapshot and never imports the resolver.
+    toolsets_list = [] if no_tools else None
+    if no_tools:
+        parsed_skills = []
+    elif toolsets:
         if isinstance(toolsets, str):
             toolsets_list = [t.strip() for t in toolsets.split(",")]
         elif isinstance(toolsets, (list, tuple)):
@@ -18094,7 +18209,8 @@ def main(
             from hermes_cli.tools_config import _get_platform_tools
             toolsets_list = sorted(_get_platform_tools(CLI_CONFIG, "cli"))
     
-    parsed_skills = _parse_skills_argument(skills)
+    if not no_tools:
+        parsed_skills = _parse_skills_argument(skills)
 
     # Create CLI instance
     cli = HermesCLI(
@@ -18111,6 +18227,7 @@ def main(
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
+        no_tools=no_tools,
     )
 
     if parsed_skills:
@@ -18164,7 +18281,8 @@ def main(
         sys.exit(0)
     
     # Register cleanup for single-query mode (interactive mode registers in run())
-    atexit.register(_run_cleanup)
+    if not no_tools:
+        atexit.register(_run_cleanup)
 
     # Also install signal handlers in single-query / `-q` mode.  Interactive
     # mode registers its own inside HermesCLI.run(), but `-q` runs
@@ -18248,10 +18366,16 @@ def main(
         # agent must wait the full MCP cold-start bound before its first
         # (and only) tool snapshot. See #51316.
         cli._single_query_mode = True
-        if not cli._claim_active_session("cli", stderr=bool(quiet)):
+        # No-tools is a non-persistent one-shot request.  It does not create
+        # an active-session lease in the selected Hermes home.
+        if not no_tools and not cli._claim_active_session("cli", stderr=bool(quiet)):
             sys.exit(1)
         try:
-            query, single_query_images = _collect_query_images(query, image)
+            if no_tools:
+                single_query_images = []
+                single_query_image_urls: list[str] = []
+            else:
+                query, single_query_images = _collect_query_images(query, image)
             # Kanban workers spawn with ``hermes chat -q "work kanban task <id>"``;
             # the actual task description lives in the task body. Mirror the
             # gateway/CLI behaviour for inbound images by scanning the body for
@@ -18259,8 +18383,9 @@ def main(
             # worker's first turn. Without this, users who paste a screenshot
             # path or URL into a kanban task body never get it routed to the
             # model's vision input.
-            single_query_image_urls: list[str] = []
-            _kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+            if not no_tools:
+                single_query_image_urls: list[str] = []
+            _kanban_task_id = "" if no_tools else os.environ.get("HERMES_KANBAN_TASK", "").strip()
             if _kanban_task_id:
                 try:
                     from hermes_cli import kanban_db as _kb
@@ -18407,7 +18532,7 @@ def main(
                         # out (→ sticky block). Gated on the env vars the
                         # dispatcher sets in `_default_spawn`; a no-op for every
                         # normal worker and every non-kanban `-q` run.
-                        if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+                        if not no_tools and os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
                             try:
                                 _run_kanban_goal_loop_q(cli, response)
                             except Exception as _goal_exc:

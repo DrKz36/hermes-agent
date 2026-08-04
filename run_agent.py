@@ -118,36 +118,73 @@ from agent.iteration_budget import IterationBudget
 from agent.interrupt_compat import request_hard_interrupt
 
 
+from agent.no_tools import NoToolsInvariantError, no_tools_bootstrap_active
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.timeouts import (
     get_provider_request_timeout,
     get_provider_stale_timeout,
 )
 
+_NO_TOOLS_IMPORT_MODE = no_tools_bootstrap_active()
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
-_loaded_env_paths = load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
-if _loaded_env_paths:
-    for _env_path in _loaded_env_paths:
-        logger.info("Loaded environment variables from %s", _env_path)
+if _NO_TOOLS_IMPORT_MODE:
+    # The constrained machine path receives its already-resolved runtime from
+    # HermesCLI.  It must not open a project or home dotenv file while loading
+    # the agent module.
+    _loaded_env_paths = ()
 else:
-    logger.info("No .env file found. Using system environment variables.")
+    _loaded_env_paths = load_hermes_dotenv(
+        hermes_home=_hermes_home,
+        project_env=_project_env,
+    )
+    if _loaded_env_paths:
+        for _env_path in _loaded_env_paths:
+            logger.info("Loaded environment variables from %s", _env_path)
+    else:
+        logger.info("No .env file found. Using system environment variables.")
 
 
-# Import our tool system
-from model_tools import (
-    get_tool_definitions,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.get_tool_definitions")
-    get_toolset_for_tool,
-    handle_function_call,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.handle_function_call")
-    check_toolset_requirements,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.check_toolset_requirements")
-)
-from tools.terminal_tool import cleanup_vm, get_active_env
+# Import our tool system only for ordinary agent sessions.  In the constrained
+# path a late call into any of these entrypoints is a policy violation, not a
+# reason to discover the registry after the no-tools boundary.
+if not _NO_TOOLS_IMPORT_MODE:
+    from model_tools import (
+        get_tool_definitions,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.get_tool_definitions")
+        get_toolset_for_tool,
+        handle_function_call,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.handle_function_call")
+        check_toolset_requirements,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.check_toolset_requirements")
+    )
+    from tools.terminal_tool import cleanup_vm, get_active_env
+    from tools.browser_tool import cleanup_browser
+else:
+    def _no_tools_runtime_entrypoint(*_args, **_kwargs):
+        raise NoToolsInvariantError("--no-tools attempted to enter a tool runtime")
+
+    get_tool_definitions = _no_tools_runtime_entrypoint  # type: ignore[assignment]
+    get_toolset_for_tool = _no_tools_runtime_entrypoint
+    handle_function_call = _no_tools_runtime_entrypoint  # type: ignore[assignment]
+    check_toolset_requirements = _no_tools_runtime_entrypoint  # type: ignore[assignment]
+
+    def cleanup_vm(*_args, **_kwargs):
+        return None
+
+    def get_active_env(*_args, **_kwargs):
+        return None
+
+    def cleanup_browser(*_args, **_kwargs):
+        return None
+
 from tools.interrupt import set_interrupt as _set_interrupt
-from tools.browser_tool import cleanup_browser
 
 
 # Agent internals extracted to agent/ package for modularity
-from agent.memory_manager import sanitize_context
+if not _NO_TOOLS_IMPORT_MODE:
+    from agent.memory_manager import sanitize_context
+else:
+    def sanitize_context(text: str) -> str:
+        """No memory spans exist in the constrained runtime."""
+        return text
 from agent.memory_provider import is_trivial_prompt
 from agent.error_classifier import FailoverReason
 from agent.redact import redact_sensitive_text
@@ -495,6 +532,7 @@ class AIAgent:
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
+        no_tools: bool = False,
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
@@ -579,6 +617,7 @@ class AIAgent:
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
+            no_tools=no_tools,
             session_db=session_db,
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,
