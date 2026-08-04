@@ -47,7 +47,11 @@ class CLIAgentSetupMixin:
             _primary_exc = exc
 
         # Primary provider auth failed — try fallback providers before giving up.
-        if runtime is None and _primary_exc is not None:
+        if (
+            runtime is None
+            and _primary_exc is not None
+            and not getattr(self, "no_tools", False)
+        ):
             from hermes_cli.auth import AuthError
             if isinstance(_primary_exc, AuthError):
                 _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []
@@ -342,19 +346,21 @@ class CLIAgentSetupMixin:
         if self.agent is not None:
             return True
 
-        _prepare_deferred_agent_startup()
-        self._install_tool_callbacks()
-        self._ensure_tirith_security()
+        if not getattr(self, "no_tools", False):
+            _prepare_deferred_agent_startup()
+            self._install_tool_callbacks()
+            self._ensure_tirith_security()
 
         if not self._ensure_runtime_credentials():
             return False
 
-        from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
+        if not getattr(self, "no_tools", False):
+            from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
 
-        ensure_mcp_discovery_before_agent_build(
-            logger=logger,
-            single_query=getattr(self, "_single_query_mode", False),
-        )
+            ensure_mcp_discovery_before_agent_build(
+                logger=logger,
+                single_query=getattr(self, "_single_query_mode", False),
+            )
 
         # Initialize SQLite session store for CLI sessions (if not already done in __init__)
         if self._session_db is None:
@@ -499,7 +505,7 @@ class CLIAgentSetupMixin:
                 clarify_callback=self._clarify_callback,
                 reasoning_callback=self._current_reasoning_callback(),
 
-                fallback_model=self._fallback_model,
+                fallback_model=[] if getattr(self, "no_tools", False) else self._fallback_model,
                 thinking_callback=self._on_thinking,
                 checkpoints_enabled=self.checkpoints_enabled,
                 checkpoint_max_snapshots=self.checkpoint_max_snapshots,
@@ -507,7 +513,8 @@ class CLIAgentSetupMixin:
                 checkpoint_max_file_size_mb=self.checkpoint_max_file_size_mb,
                 pass_session_id=self.pass_session_id,
                 skip_context_files=self.ignore_rules,
-                skip_memory=self.ignore_rules,
+                skip_memory=self.ignore_rules or getattr(self, "no_tools", False),
+                no_tools=getattr(self, "no_tools", False),
                 tool_progress_callback=self._on_tool_progress,
                 tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
                 tool_complete_callback=self._on_tool_complete if self._inline_diffs_enabled else None,
@@ -535,12 +542,13 @@ class CLIAgentSetupMixin:
             # depletion / usage-band warning shows before the first message. The
             # notice_callback is bound above → _on_notice renders the line. Idempotent
             # + fail-open inside the helper; harmless for non-Nous providers.
-            try:
-                from agent.credits_tracker import seed_credits_at_session_start
+            if not getattr(self, "no_tools", False):
+                try:
+                    from agent.credits_tracker import seed_credits_at_session_start
 
-                seed_credits_at_session_start(self.agent)
-            except Exception:
-                pass
+                    seed_credits_at_session_start(self.agent)
+                except Exception:
+                    pass
             self._active_agent_route_signature = (
                 effective_model,
                 runtime.get("provider"),

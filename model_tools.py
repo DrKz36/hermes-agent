@@ -200,7 +200,15 @@ def _run_async(coro):
 # Tool Discovery  (importing each module triggers its registry.register calls)
 # =============================================================================
 
-discover_builtin_tools()
+try:
+    from agent.no_tools import no_tools_bootstrap_active
+
+    _skip_tool_discovery = no_tools_bootstrap_active()
+except Exception:
+    _skip_tool_discovery = False
+
+if not _skip_tool_discovery:
+    discover_builtin_tools()
 
 # MCP tool discovery (external MCP servers from config) used to run here as
 # a module-level side effect.  It was removed because discover_mcp_tools()
@@ -215,12 +223,22 @@ discover_builtin_tools()
 #   - tui_gateway/server.py     -> inline on startup (no event loop)
 #   - acp_adapter/server.py     -> asyncio.to_thread on session init
 
-# Plugin tool discovery (user/project/pip plugins)
+# Plugin tool discovery (user/project/pip plugins).  The explicit CLI
+# ``--no-tools`` policy is activated before this import path; do not turn its
+# empty agent surface into a best-effort cleanup of a globally discovered
+# extension registry.
 try:
-    from hermes_cli.plugins import discover_plugins
-    discover_plugins()
-except Exception as e:
-    logger.debug("Plugin discovery failed: %s", e)
+    _skip_extension_discovery = _skip_tool_discovery
+except Exception:
+    _skip_extension_discovery = False
+
+if not _skip_extension_discovery:
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+    except Exception as e:
+        logger.debug("Plugin discovery failed: %s", e)
 
 
 # =============================================================================

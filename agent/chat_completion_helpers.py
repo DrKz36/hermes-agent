@@ -40,7 +40,6 @@ from agent.message_sanitization import (
     _repair_tool_call_arguments,
 )
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
-from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
@@ -203,6 +202,12 @@ def _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs: dict) -> dic
     only — not ``provider_preferences`` (those become a top-level ``provider``
     routing object on the OpenAI wire). Never blocks a turn on tagging.
     """
+    if getattr(agent, "no_tools", False):
+        # Provider profiles can lazily discover user extensions.  The normal
+        # runtime resolver already supplies the internal Nous transport and
+        # credentials; this decoration is non-essential and must not reopen
+        # that extension boundary in the constrained mode.
+        return anthropic_kwargs
     if getattr(agent, "provider", None) not in {"nous", "nous-portal", "nousresearch"}:
         return anthropic_kwargs
     try:
@@ -464,6 +469,13 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
+    if getattr(agent, "no_tools", False):
+        from agent.no_tools import assert_no_tools_payload
+
+        assert_no_tools_payload(
+            agent, api_kwargs, phase="non-streaming provider dispatch"
+        )
+
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
@@ -1301,11 +1313,19 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     # ── Provider profile path (registered providers) ───────────────────
     # Profiles handle per-provider quirks via hooks. When a profile is
     # found, delegate fully; otherwise fall through to the legacy flag path.
-    try:
-        from providers import get_provider_profile
-        _profile = get_provider_profile(agent.provider)
-    except Exception:
+    if getattr(agent, "no_tools", False):
+        # ``providers.get_provider_profile`` lazily imports bundled and user
+        # provider plugins. The no-tools CLI may still use Hermes' internal
+        # runtime provider adapter, but must not discover that extension
+        # surface while constructing a request.
         _profile = None
+    else:
+        try:
+            from providers import get_provider_profile
+
+            _profile = get_provider_profile(agent.provider)
+        except Exception:
+            _profile = None
 
     if _profile:
         _ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
@@ -1704,6 +1724,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    if getattr(agent, "no_tools", False):
+        # The initial empty chain is not enough: a late extension must not be
+        # able to inject a fallback and turn one constrained dispatch into a
+        # second provider attempt.
+        return False
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -2083,6 +2108,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
+    if getattr(agent, "no_tools", False):
+        from agent.no_tools import NoToolsInvariantError
+
+        # A summary is an additional provider dispatch.  A no-tools turn can
+        # never need one to complete a tool loop, so fail closed instead of
+        # silently widening a constrained request into a second call.
+        raise NoToolsInvariantError(
+            "--no-tools forbids iteration-summary provider dispatch"
+        )
     print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
 
     summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
@@ -2426,7 +2460,13 @@ def cleanup_task_resources(agent, task_id: str) -> None:
     ``browser_tool._cleanup_inactive_browser_sessions`` still handles
     idle sessions.
     """
+    if getattr(agent, "no_tools", False):
+        return
+
     try:
+        # Keep the terminal module unloaded for an entire no-tools turn.
+        from tools.terminal_tool import is_persistent_env
+
         if is_persistent_env(task_id):
             if agent.verbose_logging:
                 logging.debug(
@@ -2506,6 +2546,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     Falls back to _interruptible_api_call on provider errors indicating
     streaming is not supported.
     """
+    if getattr(agent, "no_tools", False):
+        from agent.no_tools import assert_no_tools_payload
+
+        assert_no_tools_payload(agent, api_kwargs, phase="streaming provider dispatch")
+
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
 
@@ -2579,6 +2624,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
                 def _open_bedrock_stream(next_api_kwargs: dict[str, Any]):
                     final_kwargs = dict(next_api_kwargs)
+                    if getattr(agent, "no_tools", False):
+                        from agent.no_tools import assert_no_tools_payload
+
+                        assert_no_tools_payload(
+                            agent, final_kwargs, phase="Bedrock streaming dispatch"
+                        )
                     region = final_kwargs.pop("__bedrock_region__", "us-east-1")
                     final_kwargs.pop("__bedrock_converse__", None)
                     client = _get_bedrock_runtime_client(region)
@@ -3057,6 +3108,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Native Gemini rejects OpenAI's usage-streaming extension.
             if not is_native_gemini_base_url(agent.base_url):
                 stream_kwargs["stream_options"] = {"include_usage": True}
+            if getattr(agent, "no_tools", False):
+                from agent.no_tools import assert_no_tools_payload
+
+                assert_no_tools_payload(
+                    agent, stream_kwargs, phase="OpenAI-compatible streaming dispatch"
+                )
             request_client = _set_request_client(
                 agent._create_request_openai_client(
                     reason="chat_completion_stream_request",
@@ -3550,6 +3607,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 final_kwargs,
                 log_prefix=getattr(agent, "log_prefix", ""),
             )
+            if getattr(agent, "no_tools", False):
+                from agent.no_tools import assert_no_tools_payload
+
+                assert_no_tools_payload(
+                    agent, final_kwargs, phase="Anthropic streaming dispatch"
+                )
             manager = request_client.messages.stream(**final_kwargs)
             _stream_context["manager"] = manager
             return manager.__enter__()

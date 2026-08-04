@@ -245,6 +245,17 @@ def build_top_level_parser():
     )
     _inherited_flag(
         parser,
+        "--no-tools",
+        action="store_true",
+        default=False,
+        help=(
+            "Classic chat only: fail closed unless the model tool surface is empty. "
+            "Keeps AGENTS.md/SOUL.md rules, but disables extension discovery, "
+            "MCP, memory tool injection, and late tool refresh."
+        ),
+    )
+    _inherited_flag(
+        parser,
         "--safe-mode",
         action="store_true",
         default=False,
@@ -434,6 +445,17 @@ def build_top_level_parser():
         action="store_true",
         default=argparse.SUPPRESS,
         help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills. Combine with --ignore-user-config for a fully isolated run.",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--no-tools",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=(
+            "Fail closed unless the chat tool surface is empty while governance "
+            "rules remain loaded. Incompatible with --safe-mode, --ignore-rules, "
+            "--toolsets, TUI, and --oneshot."
+        ),
     )
     _inherited_flag(
         chat_parser,

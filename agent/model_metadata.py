@@ -703,14 +703,22 @@ _URL_TO_PROVIDER: Dict[str, str] = {
 
 # Auto-extend with hostnames derived from provider profiles.
 # Any provider with a base_url not already in the map gets added automatically.
+# The no-tools bootstrap is intentionally limited to the static map: lazy
+# provider-profile discovery can import user extension code.
 try:
-    from providers import list_providers as _list_providers
-    for _pp in _list_providers():
-        _host = _pp.get_hostname()
-        if _host and _host not in _URL_TO_PROVIDER:
-            _URL_TO_PROVIDER[_host] = _pp.name
+    from agent.no_tools import no_tools_bootstrap_active as _no_tools_active
 except Exception:
-    pass
+    _no_tools_active = lambda: False
+
+if not _no_tools_active():
+    try:
+        from providers import list_providers as _list_providers
+        for _pp in _list_providers():
+            _host = _pp.get_hostname()
+            if _host and _host not in _URL_TO_PROVIDER:
+                _URL_TO_PROVIDER[_host] = _pp.name
+    except Exception:
+        pass
 
 
 def _infer_provider_from_url(base_url: str) -> Optional[str]:
