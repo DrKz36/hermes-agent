@@ -81,6 +81,23 @@ _bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pa
 if _bootstrap_root not in sys.path:
     sys.path.insert(0, _bootstrap_root)
 from hermes_cli import _startup_fast  # noqa: E402
+from agent.no_tools import (  # noqa: E402
+    NoToolsError,
+    bootstrap_no_tools_from_argv,
+    no_tools_bootstrap_active,
+)
+
+# ``main`` imports the parser's built-in command modules below.  Most of them
+# are inert, but this is still earlier than argparse can hand us a Namespace.
+# Arm the *internal* policy from the explicit argv token before that import
+# graph starts.  Full semantic validation remains post-parse in
+# ``_prepare_no_tools_cli_bootstrap_or_exit``; this early lexical pass only
+# prevents an unsafe bootstrap window.
+try:
+    _NO_TOOLS_ARGV_BOOTSTRAPPED = bootstrap_no_tools_from_argv()
+except NoToolsError as exc:
+    print(f"Error: {exc}", file=sys.stderr)
+    raise SystemExit(2) from exc
 
 # Early venv self-heal — MUST run before any third-party import below.  When
 # a prior ``hermes update`` left a recovery marker and a core package's import
@@ -516,6 +533,12 @@ _ensure_project_root_on_path_fast()
 # ---------------------------------------------------------------------------
 def _apply_profile_override() -> None:
     """Pre-parse --profile/-p and set HERMES_HOME before imports."""
+    if no_tools_bootstrap_active():
+        # The explicit no-tools policy must not consult the ambient sticky
+        # profile before argparse validates the invocation.  An explicit
+        # --profile therefore remains in argv and is rejected by the normal
+        # parser instead of resolving or reading another Hermes home.
+        return
     argv = sys.argv[1:]
     profile_name = None
     consume = 0
@@ -694,7 +717,8 @@ _apply_profile_override()
 from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
-load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
+if not no_tools_bootstrap_active():
+    load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
@@ -705,40 +729,45 @@ load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 # We also read network.force_ipv4 from the same yaml load to avoid two
 # separate config.yaml reads (saves ~17ms on every CLI startup — the second
 # `load_config()` was doing a full deep-merge for one boolean lookup).
-_FORCE_IPV4_EARLY = False
-try:
-    # Reuse read_raw_config()'s (mtime, size)-keyed cache instead of a bespoke
-    # yaml.load — the SAME parse then serves hermes_logging's
-    # _read_logging_config and any later raw reads in this process, collapsing
-    # 3-4 config.yaml parses per invocation into one.
-    from hermes_cli.config import read_raw_config as _read_raw_early
+def _load_early_config_flags() -> bool:
+    """Apply normal early config bridges and return the IPv4 preference."""
+    force_ipv4 = False
+    try:
+        # Reuse read_raw_config()'s (mtime, size)-keyed cache instead of a
+        # bespoke yaml.load. The same parse then serves hermes_logging's
+        # _read_logging_config and later raw reads in this process.
+        from hermes_cli.config import read_raw_config as _read_raw_early
 
-    _cfg_path = get_hermes_home() / "config.yaml"
-    if _cfg_path.exists():
-        _early_cfg_raw = _read_raw_early() or {}
-        # Managed scope: overlay administrator-pinned values so a managed
-        # security.redact_secrets / network.force_ipv4 wins here too. This early
-        # bridge reads config.yaml directly (before load_config is usable), so
-        # without the overlay a managed redact_secrets toggle would be ignored.
-        # Fail-open via the shared helper.
-        try:
-            from hermes_cli import managed_scope
-            _early_cfg_raw = managed_scope.apply_managed_overlay(_early_cfg_raw)
-        except Exception:
-            pass
-        if "HERMES_REDACT_SECRETS" not in os.environ:
-            _early_sec_cfg = _early_cfg_raw.get("security", {})
-            if isinstance(_early_sec_cfg, dict):
-                _early_redact = _early_sec_cfg.get("redact_secrets")
-                if _early_redact is not None:
-                    os.environ["HERMES_REDACT_SECRETS"] = str(_early_redact).lower()
-        _early_net_cfg = _early_cfg_raw.get("network", {})
-        if isinstance(_early_net_cfg, dict) and _early_net_cfg.get("force_ipv4"):
-            _FORCE_IPV4_EARLY = True
-        del _early_cfg_raw
-    del _cfg_path
-except Exception:
-    pass  # best-effort — redaction stays at default (enabled) on config errors
+        _cfg_path = get_hermes_home() / "config.yaml"
+        if _cfg_path.exists():
+            _early_cfg_raw = _read_raw_early() or {}
+            # Managed scope: overlay administrator-pinned values so a managed
+            # security.redact_secrets / network.force_ipv4 wins here too. This
+            # early bridge reads config.yaml directly (before load_config is
+            # usable), so without the overlay a managed toggle would be ignored.
+            try:
+                from hermes_cli import managed_scope
+
+                _early_cfg_raw = managed_scope.apply_managed_overlay(_early_cfg_raw)
+            except Exception:
+                pass
+            if "HERMES_REDACT_SECRETS" not in os.environ:
+                _early_sec_cfg = _early_cfg_raw.get("security", {})
+                if isinstance(_early_sec_cfg, dict):
+                    _early_redact = _early_sec_cfg.get("redact_secrets")
+                    if _early_redact is not None:
+                        os.environ["HERMES_REDACT_SECRETS"] = str(_early_redact).lower()
+            _early_net_cfg = _early_cfg_raw.get("network", {})
+            if isinstance(_early_net_cfg, dict) and _early_net_cfg.get("force_ipv4"):
+                force_ipv4 = True
+    except Exception:
+        pass  # best-effort — redaction stays at default (enabled) on config errors
+    return force_ipv4
+
+
+_FORCE_IPV4_EARLY = (
+    False if no_tools_bootstrap_active() else _load_early_config_flags()
+)
 
 # Initialize centralized file logging early — all `hermes` subcommands
 # (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
@@ -2523,7 +2552,11 @@ def _resolve_use_tui(args) -> bool:
 
 def cmd_chat(args):
     """Run interactive chat CLI."""
-    use_tui = _resolve_use_tui(args)
+    _prepare_no_tools_cli_bootstrap_or_exit(args)
+    # ``--no-tools`` owns the classic chat path.  Do not consult a profile's
+    # display.interface here: the TUI has a distinct runtime and is outside
+    # this mode's enforcement boundary.
+    use_tui = False if getattr(args, "no_tools", False) else _resolve_use_tui(args)
 
     _apply_safe_mode(args)
 
@@ -2648,11 +2681,15 @@ def cmd_chat(args):
         except Exception:
             pass
 
-    # Sync bundled skills on every CLI launch (fast -- skips unchanged skills)
-    try:
-        _sync_bundled_skills_for_startup()
-    except Exception:
-        pass
+    # Syncing bundled skills is a user-home extension operation, not part of
+    # the governance-rule loader.  Keep it out of the explicit no-tools
+    # bootstrap so a skill cannot appear before the agent has its empty
+    # registry snapshot.
+    if not getattr(args, "no_tools", False):
+        try:
+            _sync_bundled_skills_for_startup()
+        except Exception:
+            pass
 
     # --yolo: bypass all dangerous command approvals.
     # Also set in main() before _prepare_agent_startup() — that is the
@@ -2680,7 +2717,8 @@ def cmd_chat(args):
     if getattr(args, "source", None):
         os.environ["HERMES_SESSION_SOURCE"] = args.source
 
-    _pin_kanban_board_env()
+    if not getattr(args, "no_tools", False):
+        _pin_kanban_board_env()
 
     if use_tui:
         _launch_tui(
@@ -2722,6 +2760,7 @@ def cmd_chat(args):
         "max_turns": getattr(args, "max_turns", None),
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
+        "no_tools": getattr(args, "no_tools", False),
         "compact": getattr(args, "compact", False),
     }
     # Filter out None values
@@ -10659,6 +10698,13 @@ def _plugin_cli_discovery_needed() -> bool:
     argparse setup, saving ~500-650ms per invocation for users whose
     enabled plugins don't contribute any CLI command.
     """
+    # ``--no-tools`` is a chat-only policy whose safety claim depends on no
+    # extension discovery happening before its post-parse bootstrap.  An
+    # otherwise-unknown positional token must therefore fail argparse rather
+    # than taking this dynamic plugin-registration branch first.
+    if "--no-tools" in sys.argv[1:]:
+        return False
+
     first = _first_positional_argv()
     if first is None:
         # Bare ``hermes`` or only flags → defaults to ``chat``.
@@ -10732,6 +10778,13 @@ def _should_background_mcp_startup(args) -> bool:
 
 def _prepare_agent_startup(args) -> None:
     """Discover plugins/MCP/hooks for commands that can run an agent turn."""
+    _prepare_no_tools_cli_bootstrap_or_exit(args)
+    if getattr(args, "no_tools", False):
+        # The explicit policy is activated after parsing and before any
+        # extension, MCP, or hook discovery.  Rules are loaded later by the
+        # normal agent prompt path; this only excludes tool-capable startup.
+        return
+
     # --yolo: chokepoint guarantee that HERMES_YOLO_MODE is set before ANY
     # plugin/tool discovery below imports tools.approval, which freezes
     # _YOLO_MODE_FROZEN at import time (PR #7994 security design).  main()'s
@@ -10821,6 +10874,21 @@ def _apply_safe_mode(args) -> None:
     os.environ["HERMES_SAFE_MODE"] = "1"
     os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
     os.environ["HERMES_IGNORE_RULES"] = "1"
+
+
+def _prepare_no_tools_cli_bootstrap_or_exit(args, parser=None) -> None:
+    """Activate the internal no-tools policy or stop before runtime startup."""
+    if not getattr(args, "no_tools", False):
+        return
+    try:
+        from agent.no_tools import NoToolsError, prepare_no_tools_cli_bootstrap
+
+        prepare_no_tools_cli_bootstrap(args)
+    except NoToolsError as exc:
+        if parser is not None:
+            parser.error(str(exc))
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
 
 
 def _set_chat_arg_defaults(args) -> None:
@@ -11150,6 +11218,19 @@ def cmd_claw(args):
 
 def main():
     """Main entry point for hermes CLI."""
+    # The full parser registers many optional command modules before it can
+    # return an argparse Namespace.  Arm only the internal, ContextVar-backed
+    # no-tools bootstrap first; its full argument validation still happens
+    # immediately after parse_args below.  This prevents a future optional
+    # parser registration from becoming an extension-discovery gap.
+    try:
+        from agent.no_tools import NoToolsError, bootstrap_no_tools_from_argv
+
+        bootstrap_no_tools_from_argv()
+    except NoToolsError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
     _set_process_title()
@@ -12462,6 +12543,11 @@ def main():
     if args.version:
         cmd_version(args)
         return
+
+    # The no-tools bootstrap must run immediately after argparse succeeds and
+    # before the common agent-startup path has any opportunity to discover
+    # extensions, hooks, or MCP servers.
+    _prepare_no_tools_cli_bootstrap_or_exit(args, parser=parser)
 
     # --yolo: set HERMES_YOLO_MODE *before* plugin discovery.  The call to
     # _prepare_agent_startup() below triggers discover_plugins() → tool

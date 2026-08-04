@@ -6758,6 +6758,12 @@ def refresh_agent_mcp_tools(
     explicit user consent; the late-binding and between-turns paths only rebuild
     at a turn boundary, before that turn's ``tools=`` prefix is assembled).
     """
+    if getattr(agent, "no_tools", False):
+        from agent.no_tools import assert_no_tools_agent_invariant
+
+        assert_no_tools_agent_invariant(agent, phase="MCP refresh")
+        return set()
+
     from model_tools import get_tool_definitions
     from tools.registry import registry
 

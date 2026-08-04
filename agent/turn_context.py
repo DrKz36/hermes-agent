@@ -40,7 +40,6 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
@@ -75,6 +74,8 @@ def compose_user_api_content(
         return None
     injections = []
     if ext_prefetch_cache:
+        from agent.memory_manager import build_memory_context_block
+
         fenced = build_memory_context_block(ext_prefetch_cache)
         if fenced:
             injections.append(fenced)
@@ -529,7 +530,11 @@ def build_turn_context(
             agent._pending_cli_user_message = None
 
     # Hydrate todo store from conversation history.
-    if conversation_history and not agent._todo_store.has_items():
+    if (
+        not getattr(agent, "no_tools", False)
+        and conversation_history
+        and not agent._todo_store.has_items()
+    ):
         agent._hydrate_todo_store(conversation_history)
 
     # Hydrate per-session nudge counters from persisted history (issue #22357).
@@ -1050,57 +1055,60 @@ def build_turn_context(
 
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
-    try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _pre_results = _invoke_hook(
-            "pre_llm_call",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            user_message=original_user_message,
-            conversation_history=list(messages),
-            is_first_turn=(not bool(conversation_history)),
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-            parent_session_id=getattr(agent, "_parent_session_id", None) or "",
-            sender_id=getattr(agent, "_user_id", None) or "",
-        )
-        _ctx_parts: list[str] = []
-        # Spill oversized per-hook context to disk so a runaway plugin
-        # can't inflate every subsequent turn's prompt. Ported from
-        # openai/codex PR #21069 ("Spill large hook outputs from context").
+    if not getattr(agent, "no_tools", False):
         try:
-            from tools.hook_output_spill import (
-                get_spill_config as _spill_cfg,
-                spill_if_oversized as _spill_if_oversized,
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+
+            _pre_results = _invoke_hook(
+                "pre_llm_call",
+                session_id=agent.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                user_message=original_user_message,
+                conversation_history=list(messages),
+                is_first_turn=(not bool(conversation_history)),
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+                parent_session_id=getattr(agent, "_parent_session_id", None) or "",
+                sender_id=getattr(agent, "_user_id", None) or "",
             )
-            _spill_config_cached = _spill_cfg()
-        except Exception:
-            _spill_if_oversized = None  # type: ignore[assignment]
-            _spill_config_cached = None
-        for r in _pre_results:
-            _piece: str = ""
-            if isinstance(r, dict) and r.get("context"):
-                _piece = str(r["context"])
-            elif isinstance(r, str) and r.strip():
-                _piece = r
-            else:
-                continue
-            if _spill_if_oversized is not None:
-                try:
-                    _piece = _spill_if_oversized(
-                        _piece,
-                        session_id=agent.session_id,
-                        source="plugin hook",
-                        config=_spill_config_cached,
-                    )
-                except Exception as _spill_exc:
-                    logger.warning("hook context spill failed: %s", _spill_exc)
-            _ctx_parts.append(_piece)
-        if _ctx_parts:
-            plugin_user_context = "\n\n".join(_ctx_parts)
-    except Exception as exc:
-        logger.warning("pre_llm_call hook failed: %s", exc)
+            _ctx_parts: list[str] = []
+            # Spill oversized per-hook context to disk so a runaway plugin
+            # can't inflate every subsequent turn's prompt. Ported from
+            # openai/codex PR #21069 ("Spill large hook outputs from context").
+            try:
+                from tools.hook_output_spill import (
+                    get_spill_config as _spill_cfg,
+                    spill_if_oversized as _spill_if_oversized,
+                )
+
+                _spill_config_cached = _spill_cfg()
+            except Exception:
+                _spill_if_oversized = None  # type: ignore[assignment]
+                _spill_config_cached = None
+            for r in _pre_results:
+                _piece: str = ""
+                if isinstance(r, dict) and r.get("context"):
+                    _piece = str(r["context"])
+                elif isinstance(r, str) and r.strip():
+                    _piece = r
+                else:
+                    continue
+                if _spill_if_oversized is not None:
+                    try:
+                        _piece = _spill_if_oversized(
+                            _piece,
+                            session_id=agent.session_id,
+                            source="plugin hook",
+                            config=_spill_config_cached,
+                        )
+                    except Exception as _spill_exc:
+                        logger.warning("hook context spill failed: %s", _spill_exc)
+                _ctx_parts.append(_piece)
+            if _ctx_parts:
+                plugin_user_context = "\n\n".join(_ctx_parts)
+        except Exception as exc:
+            logger.warning("pre_llm_call hook failed: %s", exc)
 
     # Gateway must-deliver notes (auto-reset note, first-contact intro,
     # voice-channel change) ride the same user-message injection channel as
@@ -1108,7 +1116,11 @@ def build_turn_context(
     # One-shot: staged by the gateway right before this turn, consumed here.
     # Multimodal (list) content can't take the string sidecar — append a
     # durable text part instead of dropping the fact.
-    _gateway_notes = consume_gateway_turn_context_notes(agent)
+    _gateway_notes = (
+        ""
+        if getattr(agent, "no_tools", False)
+        else consume_gateway_turn_context_notes(agent)
+    )
     if _gateway_notes:
         _gw_turn_content = (
             messages[current_turn_user_idx].get("content")

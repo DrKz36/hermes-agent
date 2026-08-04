@@ -68,6 +68,11 @@ from agent.model_metadata import (
     parse_available_output_tokens_from_error,
     save_context_length,
 )
+from agent.no_tools import (
+    NoToolsInvariantError,
+    assert_no_tools_model_response,
+    assert_no_tools_payload,
+)
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import (
     build_prompt_cache_plan,
@@ -565,16 +570,17 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
-    try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_start",
-            session_id=agent.session_id,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_start hook failed: %s", exc)
+    if not getattr(agent, "no_tools", False):
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_start",
+                session_id=agent.session_id,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_start hook failed: %s", exc)
 
     # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
     # desktop build seeds at session OPEN (see seed_credits_at_session_start in
@@ -582,12 +588,13 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # _credits_state already exists). For the plain CLI / any path that didn't seed
     # at build, it primes credits state from /api/oauth/account (or a fixture) on the
     # first turn so depletion / usage-band warnings fire. Fail-open inside the helper.
-    try:
-        from agent.credits_tracker import seed_credits_at_session_start
+    if not getattr(agent, "no_tools", False):
+        try:
+            from agent.credits_tracker import seed_credits_at_session_start
 
-        seed_credits_at_session_start(agent)
-    except Exception:
-        logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
+            seed_credits_at_session_start(agent)
+        except Exception:
+            logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
 
     # Persist the system prompt snapshot in SQLite.  Failure here used
     # to log at DEBUG, which silently broke prefix-cache reuse on the
@@ -2223,88 +2230,97 @@ def run_conversation(
                     _xh["x-initiator"] = "user"
                     api_kwargs["extra_headers"] = _xh
                     agent._is_user_initiated_turn = False
-                try:
-                    from hermes_cli.middleware import apply_llm_request_middleware
-
-                    _llm_request_mw = apply_llm_request_middleware(
-                        api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                    )
-                    api_kwargs = _llm_request_mw.payload
-                    _original_api_kwargs = _llm_request_mw.original_payload
-                    _llm_middleware_trace = _llm_request_mw.trace
-                except Exception:
+                if getattr(agent, "no_tools", False):
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
+                else:
+                    try:
+                        from hermes_cli.middleware import apply_llm_request_middleware
 
-                try:
-                    from hermes_cli.lifecycle import (
-                        has_hook,
-                        invoke_hook as _invoke_hook,
-                    )
-                    if has_hook("pre_api_request"):
-                        request_messages = api_kwargs.get("messages")
-                        if not isinstance(request_messages, list):
-                            request_messages = api_kwargs.get("input")
-                        if not isinstance(request_messages, list):
-                            request_messages = api_messages
-                        # Shallow-copy the outer list so plugins that retain the
-                        # reference for async snapshotting don't observe later
-                        # mutations of api_messages.  The inner dicts are not
-                        # mutated by the agent loop, so a shallow copy is
-                        # sufficient; a deepcopy would walk every tool result
-                        # and base64 image on every API call.
-                        #
-                        # The ``request_messages`` and ``conversation_history``
-                        # kwargs below are pre-existing raw passthroughs
-                        # consumed by the bundled langfuse plugin
-                        # (``plugins/observability/langfuse/__init__.py:_coerce_request_messages``).
-                        # They predate ``request`` and are intentionally NOT
-                        # sanitised — secrets are not expected here because
-                        # ``api_kwargs`` is the same object passed to the
-                        # provider client.  New consumers should read the
-                        # sanitised view from ``request["body"]["messages"]``.
-                        _request_payload = agent._api_request_payload_for_hook(api_kwargs)
-                        _invoke_hook(
-                            "pre_api_request",
+                        _llm_request_mw = apply_llm_request_middleware(
+                            api_kwargs,
                             task_id=effective_task_id,
                             turn_id=turn_id,
                             api_request_id=api_request_id,
                             session_id=agent.session_id or "",
-                            user_message=original_user_message,
-                            conversation_history=list(messages),
                             platform=agent.platform or "",
                             model=agent.model,
                             provider=agent.provider,
                             base_url=agent.base_url,
                             api_mode=agent.api_mode,
                             api_call_count=api_call_count,
-                            retry_count=retry_count,
-                            request_messages=list(request_messages)
-                            if isinstance(request_messages, list)
-                            else [],
-                            message_count=len(api_messages),
-                            tool_count=len(agent.tools or []),
-                            approx_input_tokens=approx_tokens,
-                            request_char_count=total_chars,
-                            max_tokens=agent.max_tokens,
-                            started_at=api_start_time,
-                            middleware_trace=list(_llm_middleware_trace),
-                            request=_request_payload,
                         )
-                except Exception:
-                    pass
+                        api_kwargs = _llm_request_mw.payload
+                        _original_api_kwargs = _llm_request_mw.original_payload
+                        _llm_middleware_trace = _llm_request_mw.trace
+                    except Exception:
+                        _original_api_kwargs = dict(api_kwargs)
+                        _llm_middleware_trace = []
 
-                if env_var_enabled("HERMES_DUMP_REQUESTS"):
+                if not getattr(agent, "no_tools", False):
+                    try:
+                        from hermes_cli.lifecycle import (
+                            has_hook,
+                            invoke_hook as _invoke_hook,
+                        )
+
+                        if has_hook("pre_api_request"):
+                            request_messages = api_kwargs.get("messages")
+                            if not isinstance(request_messages, list):
+                                request_messages = api_kwargs.get("input")
+                            if not isinstance(request_messages, list):
+                                request_messages = api_messages
+                            # Shallow-copy the outer list so plugins that retain the
+                            # reference for async snapshotting don't observe later
+                            # mutations of api_messages.  The inner dicts are not
+                            # mutated by the agent loop, so a shallow copy is
+                            # sufficient; a deepcopy would walk every tool result
+                            # and base64 image on every API call.
+                            #
+                            # The ``request_messages`` and ``conversation_history``
+                            # kwargs below are pre-existing raw passthroughs
+                            # consumed by the bundled langfuse plugin
+                            # (``plugins/observability/langfuse/__init__.py:_coerce_request_messages``).
+                            # They predate ``request`` and are intentionally NOT
+                            # sanitised — secrets are not expected here because
+                            # ``api_kwargs`` is the same object passed to the
+                            # provider client.  New consumers should read the
+                            # sanitised view from ``request["body"]["messages"]``.
+                            _request_payload = agent._api_request_payload_for_hook(api_kwargs)
+                            _invoke_hook(
+                                "pre_api_request",
+                                task_id=effective_task_id,
+                                turn_id=turn_id,
+                                api_request_id=api_request_id,
+                                session_id=agent.session_id or "",
+                                user_message=original_user_message,
+                                conversation_history=list(messages),
+                                platform=agent.platform or "",
+                                model=agent.model,
+                                provider=agent.provider,
+                                base_url=agent.base_url,
+                                api_mode=agent.api_mode,
+                                api_call_count=api_call_count,
+                                retry_count=retry_count,
+                                request_messages=list(request_messages)
+                                if isinstance(request_messages, list)
+                                else [],
+                                message_count=len(api_messages),
+                                tool_count=len(agent.tools or []),
+                                approx_input_tokens=approx_tokens,
+                                request_char_count=total_chars,
+                                max_tokens=agent.max_tokens,
+                                started_at=api_start_time,
+                                middleware_trace=list(_llm_middleware_trace),
+                                request=_request_payload,
+                            )
+                    except Exception:
+                        pass
+
+                if (
+                    not getattr(agent, "no_tools", False)
+                    and env_var_enabled("HERMES_DUMP_REQUESTS")
+                ):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
 
                 # This object is private to the in-process MoA facade.  Add it
@@ -2375,6 +2391,12 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    if getattr(agent, "no_tools", False):
+                        assert_no_tools_payload(
+                            agent,
+                            next_api_kwargs,
+                            phase="conversation dispatch",
+                        )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -2402,8 +2424,6 @@ def run_conversation(
                         defer_logical_completion=True,
                     )
 
-                from hermes_cli.middleware import run_llm_execution_middleware
-
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
                 if _redirect_lock is not None:
@@ -2414,22 +2434,31 @@ def run_conversation(
                     _model_request_active.set()
                 _redirect_crossed_response = False
                 try:
-                    response = run_llm_execution_middleware(
-                        api_kwargs,
-                        _perform_api_call,
-                        original_request=_original_api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        middleware_trace=list(_llm_middleware_trace),
-                    )
+                    if getattr(agent, "no_tools", False):
+                        # Middleware can load extension callbacks and mutate a
+                        # request after the empty-tool assertion.  The
+                        # constrained path dispatches directly, then the
+                        # transport-level guard checks the final bytes again.
+                        response = _perform_api_call(api_kwargs)
+                    else:
+                        from hermes_cli.middleware import run_llm_execution_middleware
+
+                        response = run_llm_execution_middleware(
+                            api_kwargs,
+                            _perform_api_call,
+                            original_request=_original_api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                            middleware_trace=list(_llm_middleware_trace),
+                        )
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:
@@ -3499,6 +3528,18 @@ def run_conversation(
                 else:
                     final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{api_elapsed:.1f}s elapsed)."
                 agent._persist_session(messages, conversation_history)
+                break
+
+            except NoToolsInvariantError as api_error:
+                if thinking_spinner:
+                    thinking_spinner.stop("")
+                    thinking_spinner = None
+                if agent.thinking_callback:
+                    agent.thinking_callback("")
+                failed = True
+                _turn_exit_reason = "no_tools_policy_error"
+                final_response = f"No-tools policy blocked this turn: {api_error}"
+                messages.append({"role": "assistant", "content": final_response})
                 break
 
             except Exception as api_error:
@@ -5614,6 +5655,9 @@ def run_conversation(
         # Guard: if all retries exhausted without a successful response
         # (e.g. repeated context-length errors that exhausted retry_count),
         # the `response` variable is still None. Break out cleanly.
+        if failed and _turn_exit_reason == "no_tools_policy_error":
+            agent._persist_session(messages, conversation_history)
+            break
         if response is None:
             _turn_exit_reason = "all_retries_exhausted_no_response"
             print(f"{agent.log_prefix}❌ All API retries exhausted with no successful response.")
@@ -5650,47 +5694,49 @@ def run_conversation(
                 else:
                     assistant_message.content = str(raw)
 
-            try:
-                from hermes_cli.lifecycle import (
-                    has_hook,
-                    invoke_hook as _invoke_hook,
-                )
-                if has_hook("post_api_request"):
-                    _assistant_tool_calls = (
-                        getattr(assistant_message, "tool_calls", None) or []
+            if not getattr(agent, "no_tools", False):
+                try:
+                    from hermes_cli.lifecycle import (
+                        has_hook,
+                        invoke_hook as _invoke_hook,
                     )
-                    _assistant_text = assistant_message.content or ""
-                    _api_ended_at = api_start_time + api_duration
-                    _invoke_hook(
-                        "post_api_request",
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        api_duration=api_duration,
-                        started_at=api_start_time,
-                        ended_at=_api_ended_at,
-                        finish_reason=finish_reason,
-                        message_count=len(api_messages),
-                        response_model=getattr(response, "model", None),
-                        response=agent._api_response_payload_for_hook(
-                            response,
-                            assistant_message,
+
+                    if has_hook("post_api_request"):
+                        _assistant_tool_calls = (
+                            getattr(assistant_message, "tool_calls", None) or []
+                        )
+                        _assistant_text = assistant_message.content or ""
+                        _api_ended_at = api_start_time + api_duration
+                        _invoke_hook(
+                            "post_api_request",
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                            api_duration=api_duration,
+                            started_at=api_start_time,
+                            ended_at=_api_ended_at,
                             finish_reason=finish_reason,
-                        ),
-                        usage=agent._usage_summary_for_api_request_hook(response),
-                        assistant_message=assistant_message,
-                        assistant_content_chars=len(_assistant_text),
-                        assistant_tool_call_count=len(_assistant_tool_calls),
-                    )
-            except Exception:
-                pass
+                            message_count=len(api_messages),
+                            response_model=getattr(response, "model", None),
+                            response=agent._api_response_payload_for_hook(
+                                response,
+                                assistant_message,
+                                finish_reason=finish_reason,
+                            ),
+                            usage=agent._usage_summary_for_api_request_hook(response),
+                            assistant_message=assistant_message,
+                            assistant_content_chars=len(_assistant_text),
+                            assistant_tool_call_count=len(_assistant_tool_calls),
+                        )
+                except Exception:
+                    pass
 
             # Handle assistant response
             if assistant_message.content and not agent.quiet_mode:
@@ -5882,6 +5928,12 @@ def run_conversation(
             elif hasattr(agent, "_codex_incomplete_retries"):
                 agent._codex_incomplete_retries = 0
             
+            # Check for tool calls. A provider that returns one despite the
+            # no-tools request is a policy violation, never a repair/retry
+            # opportunity and never a dispatch candidate.
+            if getattr(agent, "no_tools", False):
+                assert_no_tools_model_response(agent, assistant_message)
+
             # Check for tool calls
             if assistant_message.tool_calls:
                 if not agent.quiet_mode:
@@ -6950,23 +7002,22 @@ def run_conversation(
                 ):
                     messages.pop()
 
-                try:
-                    from agent.verification_stop import (
-                        build_verify_on_stop_nudge,
-                        verify_on_stop_enabled,
-                    )
-
-                    if verify_on_stop_enabled():
-                        _verify_nudge = build_verify_on_stop_nudge(
-                            session_id=getattr(agent, "session_id", None),
-                            changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
-                            attempts=getattr(agent, "_verification_stop_nudges", 0),
+                _verify_nudge = None
+                if not getattr(agent, "no_tools", False):
+                    try:
+                        from agent.verification_stop import (
+                            build_verify_on_stop_nudge,
+                            verify_on_stop_enabled,
                         )
-                    else:
-                        _verify_nudge = None
-                except Exception:
-                    logger.debug("verification stop-loop check failed", exc_info=True)
-                    _verify_nudge = None
+
+                        if verify_on_stop_enabled():
+                            _verify_nudge = build_verify_on_stop_nudge(
+                                session_id=getattr(agent, "session_id", None),
+                                changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
+                                attempts=getattr(agent, "_verification_stop_nudges", 0),
+                            )
+                    except Exception:
+                        logger.debug("verification stop-loop check failed", exc_info=True)
 
                 if _verify_nudge:
                     agent._verification_stop_nudges = (
@@ -7017,30 +7068,39 @@ def run_conversation(
                 _verify_nudge2 = None
                 _edited = sorted(getattr(agent, "_turn_file_mutation_paths", set()) or [])
                 _attempt = getattr(agent, "_pre_verify_nudges", 0)
-                try:
-                    from agent.verify_hooks import max_verify_nudges
-                    from hermes_cli.lifecycle import has_hook
-                    from hermes_cli.plugins import get_pre_verify_continue_message
+                if not getattr(agent, "no_tools", False):
+                    try:
+                        from agent.verify_hooks import max_verify_nudges
+                        from hermes_cli.lifecycle import has_hook
+                        from hermes_cli.plugins import get_pre_verify_continue_message
 
-                    if _edited and has_hook("pre_verify") and _attempt < max_verify_nudges():
-                        # Posture is fixed for the session — resolve once + cache.
-                        coding = getattr(agent, "_resolved_is_coding", None)
-                        if coding is None:
-                            from agent.coding_context import is_coding_context
-                            coding = bool(is_coding_context(platform=getattr(agent, "platform", "") or ""))
-                            agent._resolved_is_coding = coding
-                        _verify_nudge2 = get_pre_verify_continue_message(
-                            session_id=getattr(agent, "session_id", None) or "",
-                            platform=getattr(agent, "platform", "") or "",
-                            model=getattr(agent, "model", "") or "",
-                            coding=coding,
-                            attempt=_attempt,
-                            final_response=final_response,
-                            changed_paths=_edited,
-                        )
-                except Exception:
-                    logger.debug("pre_verify hook check failed", exc_info=True)
-                    _verify_nudge2 = None
+                        if (
+                            _edited
+                            and has_hook("pre_verify")
+                            and _attempt < max_verify_nudges()
+                        ):
+                            # Posture is fixed for the session — resolve once + cache.
+                            coding = getattr(agent, "_resolved_is_coding", None)
+                            if coding is None:
+                                from agent.coding_context import is_coding_context
+
+                                coding = bool(
+                                    is_coding_context(
+                                        platform=getattr(agent, "platform", "") or ""
+                                    )
+                                )
+                                agent._resolved_is_coding = coding
+                            _verify_nudge2 = get_pre_verify_continue_message(
+                                session_id=getattr(agent, "session_id", None) or "",
+                                platform=getattr(agent, "platform", "") or "",
+                                model=getattr(agent, "model", "") or "",
+                                coding=coding,
+                                attempt=_attempt,
+                                final_response=final_response,
+                                changed_paths=_edited,
+                            )
+                    except Exception:
+                        logger.debug("pre_verify hook check failed", exc_info=True)
 
                 if _verify_nudge2:
                     agent._pre_verify_nudges = _attempt + 1
@@ -7077,16 +7137,17 @@ def run_conversation(
                 # report") and stop with finish_reason=stop — a clean exit
                 # that the dispatcher records as protocol_violation. Nudge
                 # once or twice before allowing that exit.
-                try:
-                    from agent.kanban_stop import build_kanban_stop_nudge
+                _kanban_nudge = None
+                if not getattr(agent, "no_tools", False):
+                    try:
+                        from agent.kanban_stop import build_kanban_stop_nudge
 
-                    _kanban_nudge = build_kanban_stop_nudge(
-                        messages=messages,
-                        attempts=getattr(agent, "_kanban_stop_nudges", 0),
-                    )
-                except Exception:
-                    logger.debug("kanban stop-loop check failed", exc_info=True)
-                    _kanban_nudge = None
+                        _kanban_nudge = build_kanban_stop_nudge(
+                            messages=messages,
+                            attempts=getattr(agent, "_kanban_stop_nudges", 0),
+                        )
+                    except Exception:
+                        logger.debug("kanban stop-loop check failed", exc_info=True)
 
                 if _kanban_nudge:
                     agent._kanban_stop_nudges = (
@@ -7128,6 +7189,13 @@ def run_conversation(
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break
             
+        except NoToolsInvariantError as e:
+            failed = True
+            _turn_exit_reason = "no_tools_policy_error"
+            final_response = f"No-tools policy blocked this turn: {e}"
+            messages.append({"role": "assistant", "content": final_response})
+            break
+
         except Exception as e:
             # Phase-aware error classification. The huge outer try/except spans
             # both the actual API request and all local post-processing of the

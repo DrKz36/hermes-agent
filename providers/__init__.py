@@ -51,6 +51,25 @@ _BUNDLED_PLUGINS_DIR = (
 )
 
 
+def _no_tools_policy_active() -> bool:
+    """Whether the chat-only no-tools policy forbids profile discovery.
+
+    Provider profiles are extension plugins: their lazy registry scans both
+    the repository and ``$HERMES_HOME`` and imports arbitrary plugin modules.
+    The internal provider routing code does not need that extension surface
+    for the explicit no-tools chat path, so keep the registry empty instead
+    of merely declining to expose its schemas later.
+    """
+    try:
+        from agent.no_tools import no_tools_bootstrap_active
+
+        return no_tools_bootstrap_active()
+    except Exception:
+        # Normal non-agent helpers can import this package without the agent
+        # package being available. They retain the historical behavior.
+        return False
+
+
 def register_provider(profile: ProviderProfile) -> None:
     """Register a provider profile by name and aliases.
 
@@ -70,6 +89,8 @@ def get_provider_profile(name: str) -> ProviderProfile | None:
 
     Returns None if the provider has no profile (falls back to generic).
     """
+    if _no_tools_policy_active():
+        return None
     if not _discovered:
         _discover_providers()
     canonical = _ALIASES.get(name, name)
@@ -78,6 +99,8 @@ def get_provider_profile(name: str) -> ProviderProfile | None:
 
 def list_providers() -> list[ProviderProfile]:
     """Return all registered provider profiles (one per canonical name)."""
+    if _no_tools_policy_active():
+        return []
     global _PROVIDER_LIST_CACHE
     if not _discovered:
         _discover_providers()

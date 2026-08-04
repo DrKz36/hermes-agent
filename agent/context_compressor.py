@@ -1490,13 +1490,25 @@ class ContextCompressor(ContextEngine):
     def _resolve_context_length(self) -> int:
         """Resolve and cache the model's context length on first access."""
         if self._resolved_context_length is None:
-            self._resolved_context_length = get_model_context_length(
-                self.model,
-                base_url=self.base_url,
-                api_key=self.api_key,
-                config_context_length=self._config_context_length,
-                provider=self.provider,
-            )
+            configured = self._config_context_length
+            if (
+                isinstance(configured, int)
+                and not isinstance(configured, bool)
+                and configured > 0
+            ):
+                # The explicit configuration has priority in
+                # ``get_model_context_length`` too. Resolve it locally so a
+                # caller that deliberately supplied a static window does not
+                # even enter the metadata/probe path before its first turn.
+                self._resolved_context_length = configured
+            else:
+                self._resolved_context_length = get_model_context_length(
+                    self.model,
+                    base_url=self.base_url,
+                    api_key=self.api_key,
+                    config_context_length=configured,
+                    provider=self.provider,
+                )
             # Small-context threshold floor: models under 512K trigger at
             # >=75% so compaction doesn't fire with half the window still
             # free. Raise-only; must run AFTER context_length is resolved

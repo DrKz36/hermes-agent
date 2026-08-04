@@ -123,31 +123,72 @@ from hermes_cli.timeouts import (
     get_provider_request_timeout,
     get_provider_stale_timeout,
 )
+from agent.no_tools import NoToolsInvariantError, no_tools_bootstrap_active
 
+_NO_TOOLS_IMPORT_MODE = no_tools_bootstrap_active()
 _hermes_home = get_hermes_home()
-_project_env = Path(__file__).parent / '.env'
-_loaded_env_paths = load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
-if _loaded_env_paths:
-    for _env_path in _loaded_env_paths:
-        logger.info("Loaded environment variables from %s", _env_path)
+
+# A CLI launch with ``--no-tools`` has already accepted the explicit policy
+# before importing this module.  Do not read a project/home dotenv or import a
+# terminal/browser tool merely to construct an agent that must have no tool
+# surface.  Runtime credentials are resolved later by the normal provider
+# adapter; this only removes tool-capable bootstrap side effects.
+if not _NO_TOOLS_IMPORT_MODE:
+    _project_env = Path(__file__).parent / '.env'
+    _loaded_env_paths = load_hermes_dotenv(
+        hermes_home=_hermes_home, project_env=_project_env
+    )
+    if _loaded_env_paths:
+        for _env_path in _loaded_env_paths:
+            logger.info("Loaded environment variables from %s", _env_path)
+    else:
+        logger.info("No .env file found. Using system environment variables.")
 else:
-    logger.info("No .env file found. Using system environment variables.")
+    _loaded_env_paths = ()
 
 
-# Import our tool system
-from model_tools import (
-    get_tool_definitions,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.get_tool_definitions")
-    get_toolset_for_tool,
-    handle_function_call,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.handle_function_call")
-    check_toolset_requirements,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.check_toolset_requirements")
-)
-from tools.terminal_tool import cleanup_vm, get_active_env
+# Import the mutable tool registry only for a normal runtime.  The no-tools
+# branch intentionally leaves it undiscovered; the stubs fail closed if a
+# future path accidentally tries to consult it.
+if not _NO_TOOLS_IMPORT_MODE:
+    from model_tools import (
+        get_tool_definitions,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.get_tool_definitions")
+        get_toolset_for_tool,
+        handle_function_call,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.handle_function_call")
+        check_toolset_requirements,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.check_toolset_requirements")
+    )
+    from tools.terminal_tool import cleanup_vm, get_active_env
+    from tools.browser_tool import cleanup_browser
+else:
+    def _no_tools_registry_access(*_args, **_kwargs):
+        raise NoToolsInvariantError(
+            "--no-tools attempted to access the tool registry after bootstrap"
+        )
+
+    get_tool_definitions = _no_tools_registry_access
+    get_toolset_for_tool = _no_tools_registry_access
+    handle_function_call = _no_tools_registry_access
+    check_toolset_requirements = _no_tools_registry_access
+
+    def cleanup_vm(*_args, **_kwargs):
+        return None
+
+    def get_active_env(*_args, **_kwargs):
+        return None
+
+    def cleanup_browser(*_args, **_kwargs):
+        return None
+
 from tools.interrupt import set_interrupt as _set_interrupt
-from tools.browser_tool import cleanup_browser
 
 
 # Agent internals extracted to agent/ package for modularity
-from agent.memory_manager import sanitize_context
+if not _NO_TOOLS_IMPORT_MODE:
+    from agent.memory_manager import sanitize_context
+else:
+    def sanitize_context(text: str) -> str:
+        """No memory spans exist in the constrained runtime."""
+        return text
 from agent.memory_provider import is_trivial_prompt
 from agent.error_classifier import FailoverReason
 from agent.redact import redact_sensitive_text
@@ -495,6 +536,7 @@ class AIAgent:
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
+        no_tools: bool = False,
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
@@ -579,6 +621,7 @@ class AIAgent:
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
+            no_tools=no_tools,
             session_db=session_db,
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,
@@ -2834,6 +2877,9 @@ class AIAgent:
         retryable: Optional[bool] = None,
         reason: Optional[str] = None,
     ) -> None:
+        if getattr(self, "no_tools", False):
+            return
+
         # Lazy module import (not from-import) so tests can replace lifecycle
         # dispatch at this call site. After first call the import is a
         # ``sys.modules`` dict lookup, so retries don't repay any real cost.
@@ -3690,7 +3736,10 @@ class AIAgent:
         self._last_activity_ts = time.time()
         self._last_activity_desc = bound_activity_description(desc)
         self._last_activity_provenance = normalize_activity_provenance(provenance)
-        if os.environ.get("HERMES_KANBAN_TASK"):
+        if (
+            os.environ.get("HERMES_KANBAN_TASK")
+            and not getattr(self, "no_tools", False)
+        ):
             try:
                 from tools.kanban_tools import (
                     heartbeat_current_worker_from_env,

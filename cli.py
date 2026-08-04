@@ -224,11 +224,13 @@ from hermes_cli.browser_connect import (
     try_launch_chrome_debug,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
+from agent.no_tools import no_tools_bootstrap_active, prepare_no_tools_cli_bootstrap
 from utils import base_url_host_matches, fast_safe_load
 
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
-load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
+if not no_tools_bootstrap_active():
+    load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
 
 
 _REASONING_TAGS = (
@@ -905,6 +907,8 @@ def AIAgent(*args, **kwargs):
 
 
 def get_tool_definitions(*args, **kwargs):
+    if no_tools_bootstrap_active():
+        return []
     from hermes_cli.mcp_startup import wait_for_mcp_discovery
     from model_tools import get_tool_definitions as _get_tool_definitions
 
@@ -913,6 +917,8 @@ def get_tool_definitions(*args, **kwargs):
 
 
 def get_toolset_for_tool(*args, **kwargs):
+    if no_tools_bootstrap_active():
+        return None
     from model_tools import get_toolset_for_tool as _get_toolset_for_tool
 
     return _get_toolset_for_tool(*args, **kwargs)
@@ -4225,6 +4231,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        no_tools: bool = False,
     ):
         """
         Initialize the Hermes CLI.
@@ -4454,11 +4461,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         else:
             self.max_turns = 500
         
-        # Parse and validate toolsets
-        self.enabled_toolsets = toolsets
-        self.disabled_toolsets = CLI_CONFIG["agent"].get("disabled_toolsets") or []
+        # ``--no-tools`` is an agent-runtime policy, not cosmetic output
+        # suppression.  Keep its toolset selection empty so every later layer
+        # sees the same intent; agent_init still owns the final invariant.
+        self.no_tools = bool(no_tools)
+        if self.no_tools:
+            from agent.no_tools import NoToolsConflictError
 
-        if toolsets and "all" not in toolsets and "*" not in toolsets:
+            if ignore_rules or os.environ.get("HERMES_IGNORE_RULES", "").strip().lower() in {
+                "1", "true", "yes", "on"
+            }:
+                raise NoToolsConflictError(
+                    "--no-tools requires AGENTS.md/SOUL.md rules to remain enabled"
+                )
+            self.enabled_toolsets = []
+            self.disabled_toolsets = []
+        else:
+            self.enabled_toolsets = toolsets
+            self.disabled_toolsets = CLI_CONFIG["agent"].get("disabled_toolsets") or []
+
+        if (
+            not self.no_tools
+            and toolsets
+            and "all" not in toolsets
+            and "*" not in toolsets
+        ):
             # Validate each toolset — MCP server names are resolved via
             # live registry aliases (registered during discover_mcp_tools),
             # but discovery hasn't run yet at this point, so exclude them.
@@ -7213,7 +7240,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._show_status()
         else:
             # Get tools for display
-            tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+            tools = (
+                []
+                if self.no_tools
+                else get_tool_definitions(
+                    enabled_toolsets=self.enabled_toolsets, quiet_mode=True
+                )
+            )
             
             # Get terminal working directory (where commands will execute)
             cwd = os.getenv("TERMINAL_CWD", os.getcwd())
@@ -7556,6 +7589,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def _show_tool_availability_warnings(self):
         """Show warnings about disabled tools due to missing API keys."""
+        if self.no_tools:
+            return
         try:
             from model_tools import check_tool_availability
             
@@ -7579,7 +7614,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     def _show_status(self):
         """Show compact startup status line."""
         # Avoid pulling the full tool registry into the bare Termux prompt path.
-        if os.environ.get("HERMES_DEFER_AGENT_STARTUP") == "1":
+        if self.no_tools:
+            tool_status = "0 tools (policy)"
+        elif os.environ.get("HERMES_DEFER_AGENT_STARTUP") == "1":
             tool_status = "tools deferred"
         else:
             tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
@@ -7749,6 +7786,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     
     def show_tools(self):
         """Display available tools with kawaii ASCII art."""
+        if self.no_tools:
+            print("(;_;) No tools available (--no-tools policy)")
+            return
         # Pre-assembly list: /tools is a discovery/inspection surface, so it
         # must show the full catalog including tools deferred behind the
         # tool_search bridge (users check this to verify an MCP installed).
@@ -9919,7 +9959,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if self.compact or term_w < 80:
                     cc.print(_build_compact_banner())
                 else:
-                    tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+                    tools = (
+                        []
+                        if self.no_tools
+                        else get_tool_definitions(
+                            enabled_toolsets=self.enabled_toolsets, quiet_mode=True
+                        )
+                    )
                     cwd = os.getenv("TERMINAL_CWD", os.getcwd())
                     ctx_len = None
                     if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
@@ -11745,6 +11791,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         After reconnecting, refreshes the agent's tool list so the model
         sees the updated tools on the next turn.
         """
+        if self.no_tools:
+            print("MCP reload refused: --no-tools policy is active.")
+            return
         try:
             from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
 
@@ -17974,6 +18023,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    no_tools: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -18010,6 +18060,37 @@ def main(
         python cli.py -w -q "Fix issue #123"     # Single query in worktree
     """
     global _active_worktree
+
+    if no_tools:
+        # ``hermes_cli.main`` normally arms this before importing ``cli``.
+        # Keep direct library callers fail-closed and subject to the same
+        # parser-equivalent contract rather than letting them bypass it.
+        from types import SimpleNamespace
+
+        direct_command = (
+            "gateway"
+            if gateway
+            else "tools"
+            if list_tools or list_toolsets
+            else "chat"
+        )
+        prepare_no_tools_cli_bootstrap(
+            SimpleNamespace(
+                no_tools=True,
+                command=direct_command,
+                safe_mode=False,
+                ignore_rules=ignore_rules,
+                tui=False,
+                oneshot=None,
+                resume=resume,
+                continue_last=None,
+                image=image,
+                worktree=worktree or w,
+                yolo=False,
+                toolsets=toolsets,
+                skills=skills,
+            )
+        )
 
     # Force UTF-8 stdio on Windows before any banner/print() runs — the
     # Rich console prints Unicode box-drawing characters that would
@@ -18062,11 +18143,17 @@ def main(
     
     # Handle query shorthand
     query = query or q
+
+    if no_tools and skills:
+        raise ValueError("--no-tools cannot be combined with --skills")
     
-    # Parse toolsets - handle both string and tuple/list inputs
-    # Default to hermes-cli toolset which includes cronjob management tools
-    toolsets_list = None
-    if toolsets:
+    # Parse toolsets - handle both string and tuple/list inputs.  The explicit
+    # no-tools mode must not resolve the CLI/MCP tool catalog at all.
+    toolsets_list = [] if no_tools else None
+    if no_tools:
+        if toolsets:
+            raise ValueError("--no-tools cannot be combined with --toolsets")
+    elif toolsets:
         if isinstance(toolsets, str):
             toolsets_list = [t.strip() for t in toolsets.split(",")]
         elif isinstance(toolsets, (list, tuple)):
@@ -18111,6 +18198,7 @@ def main(
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
+        no_tools=no_tools,
     )
 
     if parsed_skills:
@@ -18211,7 +18299,7 @@ def main(
         # first so the final debug trace isn't lost; SIGALRM deadman guards
         # the flush against any rare blocking-I/O case (the reporter measured
         # flush in <1ms; the alarm is a failsafe, not the common path).
-        if os.environ.get("HERMES_KANBAN_TASK"):
+        if os.environ.get("HERMES_KANBAN_TASK") and not getattr(cli, "no_tools", False):
             try:
                 import signal as _sig_mod
                 if hasattr(_sig_mod, "SIGALRM"):
@@ -18261,7 +18349,7 @@ def main(
             # model's vision input.
             single_query_image_urls: list[str] = []
             _kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
-            if _kanban_task_id:
+            if _kanban_task_id and not no_tools:
                 try:
                     from hermes_cli import kanban_db as _kb
                     from agent.image_routing import extract_image_refs as _extract_refs
@@ -18407,7 +18495,7 @@ def main(
                         # out (→ sticky block). Gated on the env vars the
                         # dispatcher sets in `_default_spawn`; a no-op for every
                         # normal worker and every non-kanban `-q` run.
-                        if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+                        if not no_tools and os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
                             try:
                                 _run_kanban_goal_loop_q(cli, response)
                             except Exception as _goal_exc:
@@ -18431,7 +18519,7 @@ def main(
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
+                            if not no_tools and os.environ.get("HERMES_KANBAN_TASK") and result.get(
                                 "failure_reason"
                             ) in ("rate_limit", "billing"):
                                 try:
