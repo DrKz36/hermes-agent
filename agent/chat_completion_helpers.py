@@ -40,7 +40,6 @@ from agent.message_sanitization import (
     _repair_tool_call_arguments,
 )
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
-from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
@@ -464,6 +463,11 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
+    if getattr(agent, "no_tools", False):
+        from agent.no_tools import assert_no_tools_payload
+
+        assert_no_tools_payload(agent, api_kwargs, phase="non-streaming dispatch")
+
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
@@ -536,6 +540,11 @@ def should_use_direct_api_call(agent) -> bool:
     Keep native/Codex/Bedrock/MoA transports on their established workers:
     their cancellation and client ownership differ.
     """
+    if getattr(agent, "no_tools", False):
+        # A machine-only invocation stays on the calling thread. This avoids
+        # ContextVar loss in worker threads and keeps the policy attached until
+        # the final pre-dispatch assertion.
+        return True
     if getattr(agent, "api_mode", None) != "chat_completions":
         return False
     if getattr(agent, "provider", None) == "moa":
@@ -1120,10 +1129,56 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
+def _finalize_api_kwargs(agent, payload: dict, *, phase: str) -> dict:
+    """Validate the final provider payload for the constrained path."""
+    if getattr(agent, "no_tools", False):
+        from agent.no_tools import assert_no_tools_payload
+
+        assert_no_tools_payload(agent, payload, phase=phase)
+    return payload
+
+
+def _merge_no_tools_nous_chat_extra_body(agent, payload: dict) -> dict:
+    """Apply static Nous Portal metadata without loading provider extensions.
+
+    ``--no-tools`` deliberately skips the provider-profile registry because
+    that registry can discover user or pip plugins.  The Nous OpenAI wire
+    needs only its built-in Portal attribution tags, so retain that minimal
+    transport adaptation in core.
+    """
+    if not getattr(agent, "no_tools", False):
+        return payload
+    if str(getattr(agent, "provider", "") or "").strip().lower() not in {
+        "nous",
+        "nous-portal",
+        "nousresearch",
+    }:
+        return payload
+
+    from agent.portal_tags import nous_portal_tags
+
+    merged = dict(payload)
+    extra_body = dict(merged.get("extra_body") or {})
+    extra_body.setdefault(
+        "tags", nous_portal_tags(session_id=getattr(agent, "session_id", None))
+    )
+    merged["extra_body"] = extra_body
+    return merged
+
+
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
         tools_for_api = agent.tools
+    if getattr(agent, "no_tools", False):
+        from agent.no_tools import NoToolsInvariantError, assert_no_tools_agent_invariant
+
+        assert_no_tools_agent_invariant(agent, phase="payload construction")
+        if tools_for_api:
+            raise NoToolsInvariantError(
+                "--no-tools payload construction received a non-empty tool snapshot"
+            )
+        tools_for_api = []
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
@@ -1151,7 +1206,11 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         # the profile hook that produces them is only consulted by the
         # OpenAI-wire transport. Merge them here so Messages traffic keeps
         # product attribution and sticky routing.
-        return _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs)
+        return _finalize_api_kwargs(
+            agent,
+            _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs),
+            phase="anthropic payload construction",
+        )
 
     # AWS Bedrock native Converse API — bypasses the OpenAI client entirely.
     # The adapter handles message/tool conversion and boto3 calls directly.
@@ -1159,14 +1218,14 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         _bt = agent._get_transport()
         region = getattr(agent, "_bedrock_region", None) or "us-east-1"
         guardrail = getattr(agent, "_bedrock_guardrail_config", None)
-        return _bt.build_kwargs(
+        return _finalize_api_kwargs(agent, _bt.build_kwargs(
             model=agent.model,
             messages=api_messages,
             tools=tools_for_api,
             max_tokens=agent.max_tokens or 4096,
             region=region,
             guardrail_config=guardrail,
-        )
+        ), phase="bedrock payload construction")
 
     if agent.api_mode == "codex_responses":
         _ct = agent._get_transport()
@@ -1216,7 +1275,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
                     getattr(agent, "log_prefix", ""), exc,
                 )
 
-        return _ct.build_kwargs(
+        return _finalize_api_kwargs(agent, _ct.build_kwargs(
             model=agent.model,
             messages=_msgs_for_codex,
             tools=tools_for_api,
@@ -1233,7 +1292,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             replay_encrypted_reasoning=bool(
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
             ),
-        )
+        ), phase="codex payload construction")
 
     # ── chat_completions (default) ─────────────────────────────────────
     _ct = agent._get_transport()
@@ -1301,11 +1360,15 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     # ── Provider profile path (registered providers) ───────────────────
     # Profiles handle per-provider quirks via hooks. When a profile is
     # found, delegate fully; otherwise fall through to the legacy flag path.
-    try:
-        from providers import get_provider_profile
-        _profile = get_provider_profile(agent.provider)
-    except Exception:
+    if getattr(agent, "no_tools", False):
         _profile = None
+    else:
+        try:
+            from providers import get_provider_profile
+
+            _profile = get_provider_profile(agent.provider)
+        except Exception:
+            _profile = None
 
     if _profile:
         _ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
@@ -1317,7 +1380,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         # registered providers with profiles were bypassing the strip.
         api_messages = agent._prepare_messages_for_non_vision_model(api_messages)
 
-        return _ct.build_kwargs(
+        return _finalize_api_kwargs(agent, _ct.build_kwargs(
             model=agent.model,
             messages=api_messages,
             tools=tools_for_api,
@@ -1337,7 +1400,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             anthropic_max_output=_ant_max,
             supports_reasoning=agent._supports_reasoning_extra_body(),
             qwen_session_metadata=_qwen_meta,
-        )
+        ), phase="profile payload construction")
 
     # ── Legacy flag path ────────────────────────────────────────────
     # Reached only when get_provider_profile() returns None — i.e. a
@@ -1349,7 +1412,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     # Strip image parts for non-vision models (no-op when vision-capable).
     _msgs_for_chat = agent._prepare_messages_for_non_vision_model(api_messages)
 
-    return _ct.build_kwargs(
+    payload = _ct.build_kwargs(
         model=agent.model,
         messages=_msgs_for_chat,
         tools=tools_for_api,
@@ -1384,6 +1447,10 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         anthropic_max_output=_ant_max,
         provider_name=agent.provider,
+    )
+    payload = _merge_no_tools_nous_chat_extra_body(agent, payload)
+    return _finalize_api_kwargs(
+        agent, payload, phase="chat-completions payload construction"
     )
 
 
@@ -1704,6 +1771,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    if getattr(agent, "no_tools", False):
+        # A policy violation or provider failure must never select another
+        # runtime behind the machine-only contract.
+        return False
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -2083,6 +2154,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
+    if getattr(agent, "no_tools", False):
+        from agent.no_tools import NoToolsInvariantError
+
+        raise NoToolsInvariantError(
+            "--no-tools reached an iteration limit before a text-only response"
+        )
     print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
 
     summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
@@ -2426,7 +2503,11 @@ def cleanup_task_resources(agent, task_id: str) -> None:
     ``browser_tool._cleanup_inactive_browser_sessions`` still handles
     idle sessions.
     """
+    if getattr(agent, "no_tools", False):
+        return
     try:
+        from tools.terminal_tool import is_persistent_env
+
         if is_persistent_env(task_id):
             if agent.verbose_logging:
                 logging.debug(

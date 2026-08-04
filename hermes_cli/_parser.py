@@ -252,6 +252,17 @@ def build_top_level_parser():
     )
     _inherited_flag(
         parser,
+        "--no-tools",
+        action="store_true",
+        default=False,
+        help=(
+            "Machine-only constrained chat. Requires exactly `hermes chat "
+            "--no-tools -Q -q <prompt>`; it keeps governance rules but "
+            "exposes no tools. It does not support interactive chat."
+        ),
+    )
+    _inherited_flag(
+        parser,
         "--tui",
         action="store_true",
         default=False,
@@ -352,6 +363,17 @@ def build_top_level_parser():
         "--quiet",
         action="store_true",
         help="Quiet mode for programmatic use: suppress banner, spinner, and tool previews. Only output the final response and session info.",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--no-tools",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=(
+            "Machine-only constrained chat. Requires `-Q -q <prompt>` and "
+            "does not support interactive chat, images, sessions, skills, "
+            "toolsets, MCP, plugins, or hooks."
+        ),
     )
     chat_parser.add_argument(
         "--resume",

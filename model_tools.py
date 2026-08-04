@@ -37,6 +37,7 @@ from tools.registry import (
     tool_error,
 )
 from toolsets import resolve_toolset, validate_toolset
+from agent.no_tools import NoToolsInvariantError, no_tools_bootstrap_active
 
 logger = logging.getLogger(__name__)
 
@@ -200,7 +201,8 @@ def _run_async(coro):
 # Tool Discovery  (importing each module triggers its registry.register calls)
 # =============================================================================
 
-discover_builtin_tools()
+if not no_tools_bootstrap_active():
+    discover_builtin_tools()
 
 # MCP tool discovery (external MCP servers from config) used to run here as
 # a module-level side effect.  It was removed because discover_mcp_tools()
@@ -216,11 +218,13 @@ discover_builtin_tools()
 #   - acp_adapter/server.py     -> asyncio.to_thread on session init
 
 # Plugin tool discovery (user/project/pip plugins)
-try:
-    from hermes_cli.plugins import discover_plugins
-    discover_plugins()
-except Exception as e:
-    logger.debug("Plugin discovery failed: %s", e)
+if not no_tools_bootstrap_active():
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+    except Exception as e:
+        logger.debug("Plugin discovery failed: %s", e)
 
 
 # =============================================================================
@@ -297,6 +301,10 @@ def get_tool_definitions(
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
 ) -> List[Dict[str, Any]]:
+    if no_tools_bootstrap_active():
+        raise NoToolsInvariantError(
+            "--no-tools attempted to query the model tool registry"
+        )
     """
     Get tool definitions for model API calls with toolset-based filtering.
 

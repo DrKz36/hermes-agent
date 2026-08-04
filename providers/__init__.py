@@ -70,6 +70,13 @@ def get_provider_profile(name: str) -> ProviderProfile | None:
 
     Returns None if the provider has no profile (falls back to generic).
     """
+    try:
+        from agent.no_tools import no_tools_bootstrap_active
+
+        if no_tools_bootstrap_active():
+            return None
+    except Exception:
+        pass
     if not _discovered:
         _discover_providers()
     canonical = _ALIASES.get(name, name)
@@ -79,6 +86,13 @@ def get_provider_profile(name: str) -> ProviderProfile | None:
 def list_providers() -> list[ProviderProfile]:
     """Return all registered provider profiles (one per canonical name)."""
     global _PROVIDER_LIST_CACHE
+    try:
+        from agent.no_tools import no_tools_bootstrap_active
+
+        if no_tools_bootstrap_active():
+            return []
+    except Exception:
+        pass
     if not _discovered:
         _discover_providers()
     if _PROVIDER_LIST_CACHE is not None:
