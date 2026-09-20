@@ -32,12 +32,6 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenR
 
 ---
 
-## FG fork coordination
-
-For `DrKz36/hermes-agent`, the advisory Clotho–Hermes coordination role
-from GPT Web is recorded in [AGENTS.md](AGENTS.md#fg-fork-coordination-from-gpt-web).
-This fork-specific mandate does not change upstream Hermes governance.
-
 ## Quick Install
 
 ### Linux, macOS, WSL2, Termux
