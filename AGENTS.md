@@ -4,6 +4,20 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 **Never give up on the right solution.**
 
+## FG fork: coordination from GPT Web
+
+This section applies only to `DrKz36/hermes-agent`, not to upstream Hermes.
+FG delegates the cross-project overview of Clotho–Hermes and relevant Jev
+work to ChatGPT in the “Coordination Clotho” GPT Web project/thread.
+Consider evidence-backed findings and process-transfer proposals; record
+local disagreements and relevant deltas in the handoff. Adapt and verify
+each proposed transfer in this fork's context.
+The local lead retains its mandate and integration responsibility, with no
+mandatory wait for the coordinator. Advice grants no runtime, provider,
+memory, credential or deployment permission. Desk/SQLite remain Clotho's
+operational canon; this fork is not proof of the installed Hermes version.
+[Shared coordination mandate](https://github.com/DrKz36/clotho/blob/55cd97517735f75c4110bea95120ed670f992a76/docs/COORDINATION_GPT_WEB.md).
+
 ## What Hermes Is
 
 Hermes is a personal AI agent that runs the same agent core across a CLI, a
